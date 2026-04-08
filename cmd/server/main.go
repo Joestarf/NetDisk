@@ -2,18 +2,21 @@ package main // 可执行程序入口
 
 import ( // 依赖
 	"crypto/rand" // 生成随机字节，用来创建文件 id（避免重复）
-	"encoding/hex" // 把随机字节转成十六进制字符串，便于作为可读 id
-	"encoding/json" // 输出 json 格式
-	"errors"        // 判断错误类型，例如是否是文件不存在
-	"io"            // 处理流式读写（上传文件时按流复制）
-	"log" // 日志输出
+	"database/sql"
+	"encoding/hex"   // 把随机字节转成十六进制字符串，便于作为可读 id
+	"encoding/json"  // 输出 json 格式
+	"errors"         // 判断错误类型，例如是否是文件不存在
+	"io"             // 处理流式读写（上传文件时按流复制）
+	"log"            // 日志输出
 	"mime/multipart" // 处理 multipart/form-data 上传请求
-	"net/http" // http 服务器
-	"os"       // 环境变量读取
-	"path/filepath" // 路径拼接和文件名清理，避免路径注入
-	"strings"       // 字符串处理（trim、前缀判断、分割）
-	"sync"          // 并发锁，保护 map 读写安全
-	"time"          // 记录创建时间
+	"net/http"       // http 服务器
+	"os"             // 环境变量读取
+	"path/filepath"  // 路径拼接和文件名清理，避免路径注入
+	"strings"        // 字符串处理（trim、前缀判断、分割）
+	"sync"           // 并发锁，保护 map 读写安全
+	"time"           // 记录创建时间
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
 // apiResponse 统一响应体：第一步 health 和第二步文件接口都复用该结构。
@@ -36,6 +39,8 @@ type fileRecord struct {
 var (
 	// storageDir 第二步新增：上传文件落盘目录。
 	storageDir = "data/uploads" // 上传文件保存目录
+	// dbConn 是 MySQL 连接，用于持久化文件元数据。
+	dbConn *sql.DB
 	// filesMu + filesByID 第二步新增：内存索引与并发保护。
 	// RWMutex 含义：
 	// 1) RLock/RUnlock 用于读操作，可并发读。
@@ -44,8 +49,8 @@ var (
 	// filesByID 作用：
 	// 1) key 是文件 id。
 	// 2) value 是文件元数据（名字、大小、磁盘路径等）。
-	// 当前为了快速演示放在内存，服务重启后会丢失。
-	filesByID  = make(map[string]*fileRecord)
+	// 当前作为读缓存，服务重启时会从 MySQL 自动恢复。
+	filesByID = make(map[string]*fileRecord)
 )
 
 func main() {
@@ -61,12 +66,23 @@ func main() {
 		log.Fatalf("failed to init storage dir: %v", err)
 	}
 
+	var err error
+	dbConn, err = initMySQL()
+	if err != nil {
+		log.Fatalf("failed to init mysql: %v", err)
+	}
+	defer dbConn.Close()
+
+	if err := loadFilesFromDB(); err != nil {
+		log.Fatalf("failed to load file index from mysql: %v", err)
+	}
+
 	// 第一步接口：健康检查。
 	http.HandleFunc("/health", healthHandler)
 	// 第二步接口：上传、列表、单文件动作路由分发。
-	http.HandleFunc("/api/v1/files/upload", uploadHandler) // 上传
+	http.HandleFunc("/api/v1/files/upload", uploadHandler)   // 上传
 	http.HandleFunc("/api/v1/files", filesCollectionHandler) // 列表
-	http.HandleFunc("/api/v1/files/", fileItemHandler) // 下载/重命名/删除
+	http.HandleFunc("/api/v1/files/", fileItemHandler)       // 下载/重命名/删除
 
 	// 启动服务器，监听指定端口。
 	// ListenAndServe 会阻塞在这里，直到服务退出或报错。
@@ -140,7 +156,7 @@ func filesCollectionHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filesMu.RLock() // 读锁，允许并发读取
+	filesMu.RLock()                                            // 读锁，允许并发读取
 	items := make([]map[string]interface{}, 0, len(filesByID)) // 预分配容量减少扩容开销
 	// 遍历内存索引，组装响应数组。
 	for _, rec := range filesByID {
@@ -224,6 +240,15 @@ func renameHandler(w http.ResponseWriter, r *http.Request, id string) {
 		writeError(w, http.StatusNotFound, 10005, "file not found")
 		return
 	}
+	if err := updateFileNameInDB(id, req.Name); err != nil {
+		filesMu.Unlock()
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, 10005, "file not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, 10009, "failed to persist file metadata")
+		return
+	}
 	rec.Name = req.Name // 只改显示名，不改磁盘文件名
 	filesMu.Unlock()
 
@@ -239,20 +264,28 @@ func renameHandler(w http.ResponseWriter, r *http.Request, id string) {
 
 // deleteHandler 第二步新增：先删内存索引，再删磁盘文件。
 func deleteHandler(w http.ResponseWriter, _ *http.Request, id string) {
-	filesMu.Lock() // 写锁，准备删除索引
+	filesMu.RLock()
 	rec, ok := filesByID[id]
 	if !ok {
-		filesMu.Unlock()
+		filesMu.RUnlock()
 		writeError(w, http.StatusNotFound, 10005, "file not found")
 		return
 	}
-	delete(filesByID, id) // 先从内存索引删除
-	filesMu.Unlock()
+	filesMu.RUnlock()
 
 	if err := os.Remove(rec.DiskPath); err != nil && !errors.Is(err, os.ErrNotExist) { // 再删磁盘文件
 		writeError(w, http.StatusInternalServerError, 10008, "failed to delete file from disk")
 		return
 	}
+
+	if err := deleteFileFromDB(id); err != nil {
+		writeError(w, http.StatusInternalServerError, 10009, "failed to persist file metadata")
+		return
+	}
+
+	filesMu.Lock()
+	delete(filesByID, id)
+	filesMu.Unlock()
 
 	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Message: "deleted"})
 }
@@ -268,7 +301,7 @@ func saveUploadedFile(src multipart.File, hdr *multipart.FileHeader) (*fileRecor
 	if name == "" {
 		name = "unnamed" // 没有文件名时给默认值
 	}
-	ext := filepath.Ext(name) // 保留扩展名
+	ext := filepath.Ext(name)                     // 保留扩展名
 	diskPath := filepath.Join(storageDir, id+ext) // 磁盘保存路径用 id 命名
 
 	dst, err := os.Create(diskPath) // 创建目标文件
@@ -291,6 +324,11 @@ func saveUploadedFile(src multipart.File, hdr *multipart.FileHeader) (*fileRecor
 	}
 
 	filesMu.Lock() // 写入内存索引
+	if err := insertFileToDB(rec); err != nil {
+		filesMu.Unlock()
+		_ = os.Remove(diskPath)
+		return nil, err
+	}
 	filesByID[id] = rec
 	filesMu.Unlock()
 
@@ -319,7 +357,7 @@ func parseFileAction(path string) (id string, action string, err error) {
 		return "", "", os.ErrNotExist
 	}
 
-	rest := strings.TrimPrefix(path, prefix) // 去掉前缀
+	rest := strings.TrimPrefix(path, prefix)             // 去掉前缀
 	parts := strings.Split(strings.Trim(rest, "/"), "/") // 例如 [id], [id download], [id rename]
 	if len(parts) == 0 || parts[0] == "" {
 		return "", "", os.ErrNotExist
@@ -357,4 +395,125 @@ func writeJSON(w http.ResponseWriter, status int, body apiResponse) {
 // writeError 第二步新增：统一错误返回，避免每个 handler 重复写样板。
 func writeError(w http.ResponseWriter, status int, code int, message string) {
 	writeJSON(w, status, apiResponse{Code: code, Message: message}) // 统一错误出口
+}
+
+// initMySQL 初始化数据库连接并确保 files 表存在。
+// 需要配置环境变量 MYSQL_DSN，例如：
+// root:password@tcp(127.0.0.1:3306)/netdisk?charset=utf8mb4&loc=Local
+func initMySQL() (*sql.DB, error) {
+	dsn := strings.TrimSpace(os.Getenv("MYSQL_DSN"))
+	if dsn == "" {
+		return nil, errors.New("MYSQL_DSN is empty")
+	}
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
+	const ddl = `
+CREATE TABLE IF NOT EXISTS files (
+  id VARCHAR(64) PRIMARY KEY,
+  name VARCHAR(255) NOT NULL,
+  size_bytes BIGINT NOT NULL,
+  created_at_unix BIGINT NOT NULL,
+  disk_path VARCHAR(1024) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+`
+	if _, err := db.Exec(ddl); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
+	return db, nil
+}
+
+// loadFilesFromDB 启动时读取 MySQL 元数据并恢复到内存索引。
+func loadFilesFromDB() error {
+	rows, err := dbConn.Query("SELECT id, name, size_bytes, created_at_unix, disk_path FROM files")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type rowData struct {
+		id        string
+		name      string
+		size      int64
+		createdAt int64
+		diskPath  string
+	}
+
+	items := make([]rowData, 0)
+	for rows.Next() {
+		var r rowData
+		if err := rows.Scan(&r.id, &r.name, &r.size, &r.createdAt, &r.diskPath); err != nil {
+			return err
+		}
+		items = append(items, r)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	filesMu.Lock()
+	defer filesMu.Unlock()
+	filesByID = make(map[string]*fileRecord, len(items))
+
+	for _, r := range items {
+		if _, err := os.Stat(r.diskPath); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				_, _ = dbConn.Exec("DELETE FROM files WHERE id = ?", r.id)
+				continue
+			}
+			return err
+		}
+
+		filesByID[r.id] = &fileRecord{
+			ID:        r.id,
+			Name:      r.name,
+			SizeBytes: r.size,
+			CreatedAt: time.Unix(r.createdAt, 0),
+			DiskPath:  r.diskPath,
+		}
+	}
+
+	return nil
+}
+
+func insertFileToDB(rec *fileRecord) error {
+	_, err := dbConn.Exec(
+		"INSERT INTO files(id, name, size_bytes, created_at_unix, disk_path) VALUES (?, ?, ?, ?, ?)",
+		rec.ID,
+		rec.Name,
+		rec.SizeBytes,
+		rec.CreatedAt.Unix(),
+		rec.DiskPath,
+	)
+	return err
+}
+
+func updateFileNameInDB(id string, name string) error {
+	result, err := dbConn.Exec("UPDATE files SET name = ? WHERE id = ?", name, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return os.ErrNotExist
+	}
+	return nil
+}
+
+func deleteFileFromDB(id string) error {
+	_, err := dbConn.Exec("DELETE FROM files WHERE id = ?", id)
+	return err
 }
