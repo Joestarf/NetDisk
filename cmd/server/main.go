@@ -586,10 +586,18 @@ func folderItemHandler(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case action == "rename" && r.Method == http.MethodPatch:
+		if id == 0 {
+			writeError(w, http.StatusBadRequest, 10028, "root folder cannot be renamed")
+			return
+		}
 		renameFolderHandler(w, r, user.ID, id)
 	case action == "children" && r.Method == http.MethodGet:
 		folderChildrenHandler(w, r, user.ID, id)
 	case action == "" && r.Method == http.MethodDelete:
+		if id == 0 {
+			writeError(w, http.StatusBadRequest, 10029, "root folder cannot be deleted")
+			return
+		}
 		deleteFolderHandler(w, r, user.ID, id)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, 10001, "method not allowed")
@@ -668,12 +676,16 @@ func deleteFolderHandler(w http.ResponseWriter, _ *http.Request, ownerID int64, 
 }
 
 func folderChildrenHandler(w http.ResponseWriter, _ *http.Request, ownerID int64, folderID int64) {
-	if _, err := getFolderByIDForOwner(ownerID, folderID); err != nil {
-		writeError(w, http.StatusNotFound, 10019, "folder not found")
-		return
+	var parentID *int64
+	if folderID != 0 {
+		if _, err := getFolderByIDForOwner(ownerID, folderID); err != nil {
+			writeError(w, http.StatusNotFound, 10019, "folder not found")
+			return
+		}
+		parentID = &folderID
 	}
 
-	children, err := listChildrenInFolder(ownerID, folderID)
+	children, err := listChildrenByParent(ownerID, parentID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, 10023, "failed to list children")
 		return
@@ -944,6 +956,12 @@ func parseFolderAction(path string) (id int64, action string, err error) {
 	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
 		return 0, "", os.ErrNotExist
 	}
+	if parts[0] == "root" {
+		if len(parts) == 2 {
+			return 0, parts[1], nil
+		}
+		return 0, "", nil
+	}
 
 	id, err = strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
@@ -1107,14 +1125,11 @@ func siblingNameExists(ownerID int64, parentID *int64, name string, excludeFolde
 	return fileCount > 0, nil
 }
 
-func listChildrenInFolder(ownerID int64, folderID int64) ([]map[string]interface{}, error) {
+func listChildrenByParent(ownerID int64, parentID *int64) ([]map[string]interface{}, error) {
 	items := make([]map[string]interface{}, 0)
 
-	fRows, err := dbConn.Query(
-		"SELECT id, name, created_at_unix FROM folders WHERE owner_id = ? AND parent_id = ? ORDER BY name ASC",
-		ownerID,
-		folderID,
-	)
+	queryFolders := "SELECT id, name, created_at_unix FROM folders WHERE owner_id = ? AND ((parent_id IS NULL AND ? IS NULL) OR parent_id = ?) ORDER BY name ASC"
+	fRows, err := dbConn.Query(queryFolders, ownerID, int64Value(parentID), int64Value(parentID))
 	if err != nil {
 		return nil, err
 	}
@@ -1127,12 +1142,15 @@ func listChildrenInFolder(ownerID int64, folderID int64) ([]map[string]interface
 		if err := fRows.Scan(&id, &name, &created); err != nil {
 			return nil, err
 		}
-		parentCopy := folderID
+		var parentCopy interface{}
+		if parentID != nil {
+			parentCopy = *parentID
+		}
 		items = append(items, map[string]interface{}{
 			"type":       "folder",
 			"id":         id,
 			"name":       name,
-			"parent_id":  &parentCopy,
+			"parent_id":  parentCopy,
 			"created_at": time.Unix(created, 0),
 		})
 	}
@@ -1145,9 +1163,16 @@ func listChildrenInFolder(ownerID int64, folderID int64) ([]map[string]interface
 		if rec.OwnerID != ownerID {
 			continue
 		}
-		if rec.ParentID == nil || *rec.ParentID != folderID {
-			continue
+		if parentID == nil {
+			if rec.ParentID != nil {
+				continue
+			}
+		} else {
+			if rec.ParentID == nil || *rec.ParentID != *parentID {
+				continue
+			}
 		}
+
 		items = append(items, map[string]interface{}{
 			"type":         "file",
 			"id":           rec.ID,
@@ -1161,6 +1186,7 @@ func listChildrenInFolder(ownerID int64, folderID int64) ([]map[string]interface
 	filesMu.RUnlock()
 
 	return items, nil
+
 }
 
 func moveFileNode(ownerID int64, fileID string, targetParentID *int64) error {
