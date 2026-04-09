@@ -11,8 +11,8 @@ type APIResponse struct {
 
 // FileRecord 文件元数据模型
 type FileRecord struct {
-	ID       string    `json:"id"`         // 文件唯一 id
-	Name     string    `json:"name"`       // 文件名（可重命名）
+	ID        string    `json:"id"`         // 文件唯一 id
+	Name      string    `json:"name"`       // 文件名（可重命名）
 	SizeBytes int64     `json:"size_bytes"` // 文件大小
 	CreatedAt time.Time `json:"created_at"` // 创建时间
 	OwnerID   int64     `json:"-"`          // 所属用户 id

@@ -8,9 +8,11 @@ import (
 // Config 应用配置
 type Config struct {
 	Port       string
-	MYSQLDN string
+	MySQLDSN   string
 	StorageDir string
 }
+
+const DefaultStorageDir = "data/uploads"
 
 // Load 从环境变量加载配置
 func Load() Config {
@@ -20,12 +22,12 @@ func Load() Config {
 	}
 
 	mysqlDSN := strings.TrimSpace(os.Getenv("MYSQL_DSN"))
-	
-	storageDir := "data/uploads"
+
+	storageDir := DefaultStorageDir
 
 	return Config{
 		Port:       port,
-		MYSQLDN: mysqlDSN,
+		MySQLDSN:   mysqlDSN,
 		StorageDir: storageDir,
 	}
 }

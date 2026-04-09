@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"netdisk/config"
 	"netdisk/db"
 	"netdisk/middleware"
 	"netdisk/models"
@@ -228,7 +228,7 @@ func saveUploadedFile(src multipart.File, hdr *multipart.FileHeader, ownerID int
 		return nil, err
 	}
 
-	storageDir := "data/uploads"
+	storageDir := config.DefaultStorageDir
 	name := filepath.Base(strings.TrimSpace(hdr.Filename))
 	if name == "" {
 		name = "unnamed"

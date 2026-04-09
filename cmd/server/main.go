@@ -1,14 +1,14 @@
 package main
 
 import (
-"log"
-"net/http"
-"os"
+	"log"
+	"net/http"
+	"os"
 
-"netdisk/config"
-"netdisk/db"
-"netdisk/handlers"
-"netdisk/middleware"
+	"netdisk/config"
+	"netdisk/db"
+	"netdisk/handlers"
+	"netdisk/middleware"
 )
 
 func main() {
@@ -18,7 +18,7 @@ func main() {
 		log.Fatalf("failed to init storage dir: %v", err)
 	}
 
-	if err := db.Init(cfg.MYSQLDN); err != nil {
+	if err := db.Init(cfg.MySQLDSN); err != nil {
 		log.Fatalf("failed to init mysql: %v", err)
 	}
 	defer db.Close()
