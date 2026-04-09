@@ -14,9 +14,10 @@ import ( // 依赖
 	"net/http"       // http 服务器
 	"os"             // 环境变量读取
 	"path/filepath"  // 路径拼接和文件名清理，避免路径注入
-	"strings"        // 字符串处理（trim、前缀判断、分割）
-	"sync"           // 并发锁，保护 map 读写安全
-	"time"           // 记录创建时间
+	"strconv"
+	"strings" // 字符串处理（trim、前缀判断、分割）
+	"sync"    // 并发锁，保护 map 读写安全
+	"time"    // 记录创建时间
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -36,7 +37,16 @@ type fileRecord struct {
 	SizeBytes int64     `json:"size_bytes"` // 文件大小
 	CreatedAt time.Time `json:"created_at"` // 创建时间
 	OwnerID   int64     `json:"-"`          // 所属用户 id
+	ParentID  *int64    `json:"-"`          // 所属文件夹（nil 表示根目录）
 	DiskPath  string    `json:"-"`          // 磁盘真实路径，不对外返回
+}
+
+type folderRecord struct {
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	OwnerID   int64     `json:"-"`
+	ParentID  *int64    `json:"parent_id,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type authUser struct {
@@ -67,6 +77,11 @@ const (
 	authUserKey  contextKey    = "auth_user"
 	authTokenKey contextKey    = "auth_token"
 	tokenTTL     time.Duration = 7 * 24 * time.Hour
+)
+
+var (
+	errNameConflict = errors.New("name conflict")
+	errInvalidMove  = errors.New("invalid move")
 )
 
 func main() {
@@ -104,6 +119,10 @@ func main() {
 	http.HandleFunc("/api/v1/files/upload", authMiddleware(uploadHandler))   // 上传
 	http.HandleFunc("/api/v1/files", authMiddleware(filesCollectionHandler)) // 列表
 	http.HandleFunc("/api/v1/files/", authMiddleware(fileItemHandler))       // 下载/重命名/删除
+	// 第四步接口：文件夹与节点操作。
+	http.HandleFunc("/api/v1/folders", authMiddleware(foldersCollectionHandler))
+	http.HandleFunc("/api/v1/folders/", authMiddleware(folderItemHandler))
+	http.HandleFunc("/api/v1/nodes/move", authMiddleware(moveNodeHandler))
 
 	// 启动服务器，监听指定端口。
 	// ListenAndServe 会阻塞在这里，直到服务退出或报错。
@@ -386,7 +405,19 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer src.Close() // 及时关闭上传流
 
-	record, err := saveUploadedFile(src, hdr, user.ID) // 保存到本地并写入内存索引
+	parentID, err := parseOptionalInt64(strings.TrimSpace(r.FormValue("parent_id")))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, 10015, "invalid parent_id")
+		return
+	}
+	if parentID != nil {
+		if _, err := getFolderByIDForOwner(user.ID, *parentID); err != nil {
+			writeError(w, http.StatusBadRequest, 10016, "parent folder not found")
+			return
+		}
+	}
+
+	record, err := saveUploadedFile(src, hdr, user.ID, parentID) // 保存到本地并写入内存索引
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, 10003, "failed to save file")
 		return
@@ -401,6 +432,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 			"id":           record.ID,
 			"name":         record.Name,
 			"size_bytes":   record.SizeBytes,
+			"parent_id":    record.ParentID,
 			"download_url": "/api/v1/files/" + record.ID + "/download",
 		},
 	})
@@ -432,6 +464,7 @@ func filesCollectionHandler(w http.ResponseWriter, r *http.Request) {
 			"name":         rec.Name,
 			"size_bytes":   rec.SizeBytes,
 			"created_at":   rec.CreatedAt,
+			"parent_id":    rec.ParentID,
 			"download_url": "/api/v1/files/" + rec.ID + "/download",
 		})
 	}
@@ -474,6 +507,255 @@ func fileItemHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, 10001, "method not allowed")
 	}
+}
+
+func foldersCollectionHandler(w http.ResponseWriter, r *http.Request) {
+	user, ok := currentUser(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, 10010, "unauthorized")
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, 10001, "method not allowed")
+		return
+	}
+
+	type createFolderRequest struct {
+		Name     string `json:"name"`
+		ParentID *int64 `json:"parent_id"`
+	}
+
+	var req createFolderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, 10006, "invalid json body")
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, 10017, "folder name cannot be empty")
+		return
+	}
+
+	if req.ParentID != nil {
+		if _, err := getFolderByIDForOwner(user.ID, *req.ParentID); err != nil {
+			writeError(w, http.StatusBadRequest, 10016, "parent folder not found")
+			return
+		}
+	}
+
+	exists, err := siblingNameExists(user.ID, req.ParentID, req.Name, nil, nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, 10003, "failed to create folder")
+		return
+	}
+	if exists {
+		writeError(w, http.StatusConflict, 10018, "name already exists in folder")
+		return
+	}
+
+	folderID, err := createFolderInDB(user.ID, req.Name, req.ParentID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, 10003, "failed to create folder")
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, apiResponse{
+		Code:    0,
+		Message: "folder created",
+		Data: map[string]interface{}{
+			"id":        folderID,
+			"name":      req.Name,
+			"parent_id": req.ParentID,
+		},
+	})
+}
+
+func folderItemHandler(w http.ResponseWriter, r *http.Request) {
+	user, ok := currentUser(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, 10010, "unauthorized")
+		return
+	}
+
+	id, action, err := parseFolderAction(r.URL.Path)
+	if err != nil {
+		writeError(w, http.StatusNotFound, 10004, "not found")
+		return
+	}
+
+	switch {
+	case action == "rename" && r.Method == http.MethodPatch:
+		renameFolderHandler(w, r, user.ID, id)
+	case action == "children" && r.Method == http.MethodGet:
+		folderChildrenHandler(w, r, user.ID, id)
+	case action == "" && r.Method == http.MethodDelete:
+		deleteFolderHandler(w, r, user.ID, id)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, 10001, "method not allowed")
+	}
+}
+
+func renameFolderHandler(w http.ResponseWriter, r *http.Request, ownerID int64, folderID int64) {
+	type renameRequest struct {
+		Name string `json:"name"`
+	}
+
+	var req renameRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, 10006, "invalid json body")
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, 10017, "folder name cannot be empty")
+		return
+	}
+
+	folder, err := getFolderByIDForOwner(ownerID, folderID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, 10019, "folder not found")
+		return
+	}
+
+	exists, err := siblingNameExists(ownerID, folder.ParentID, req.Name, &folderID, nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, 10020, "failed to rename folder")
+		return
+	}
+	if exists {
+		writeError(w, http.StatusConflict, 10018, "name already exists in folder")
+		return
+	}
+
+	if err := updateFolderNameInDB(ownerID, folderID, req.Name); err != nil {
+		writeError(w, http.StatusInternalServerError, 10020, "failed to rename folder")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:    0,
+		Message: "folder renamed",
+		Data: map[string]interface{}{
+			"id":   folderID,
+			"name": req.Name,
+		},
+	})
+}
+
+func deleteFolderHandler(w http.ResponseWriter, _ *http.Request, ownerID int64, folderID int64) {
+	if _, err := getFolderByIDForOwner(ownerID, folderID); err != nil {
+		writeError(w, http.StatusNotFound, 10019, "folder not found")
+		return
+	}
+
+	hasChildren, err := hasChildrenInFolder(ownerID, folderID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, 10021, "failed to delete folder")
+		return
+	}
+	if hasChildren {
+		writeError(w, http.StatusConflict, 10022, "folder is not empty")
+		return
+	}
+
+	if err := deleteFolderInDB(ownerID, folderID); err != nil {
+		writeError(w, http.StatusInternalServerError, 10021, "failed to delete folder")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Message: "folder deleted"})
+}
+
+func folderChildrenHandler(w http.ResponseWriter, _ *http.Request, ownerID int64, folderID int64) {
+	if _, err := getFolderByIDForOwner(ownerID, folderID); err != nil {
+		writeError(w, http.StatusNotFound, 10019, "folder not found")
+		return
+	}
+
+	children, err := listChildrenInFolder(ownerID, folderID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, 10023, "failed to list children")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: children})
+}
+
+func moveNodeHandler(w http.ResponseWriter, r *http.Request) {
+	user, ok := currentUser(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, 10010, "unauthorized")
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, 10001, "method not allowed")
+		return
+	}
+
+	type moveRequest struct {
+		NodeType       string `json:"node_type"`
+		NodeID         string `json:"node_id"`
+		TargetFolderID *int64 `json:"target_folder_id"`
+	}
+
+	var req moveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, 10006, "invalid json body")
+		return
+	}
+	req.NodeType = strings.TrimSpace(req.NodeType)
+
+	if req.TargetFolderID != nil {
+		if _, err := getFolderByIDForOwner(user.ID, *req.TargetFolderID); err != nil {
+			writeError(w, http.StatusBadRequest, 10016, "target folder not found")
+			return
+		}
+	}
+
+	switch req.NodeType {
+	case "file":
+		if err := moveFileNode(user.ID, req.NodeID, req.TargetFolderID); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeError(w, http.StatusNotFound, 10005, "file not found")
+				return
+			}
+			if errors.Is(err, errNameConflict) {
+				writeError(w, http.StatusConflict, 10018, "name already exists in folder")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, 10024, "failed to move node")
+			return
+		}
+	case "folder":
+		folderID, err := strconv.ParseInt(strings.TrimSpace(req.NodeID), 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, 10025, "invalid folder id")
+			return
+		}
+		if err := moveFolderNode(user.ID, folderID, req.TargetFolderID); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeError(w, http.StatusNotFound, 10019, "folder not found")
+				return
+			}
+			if errors.Is(err, errInvalidMove) {
+				writeError(w, http.StatusBadRequest, 10026, "invalid move target")
+				return
+			}
+			if errors.Is(err, errNameConflict) {
+				writeError(w, http.StatusConflict, 10018, "name already exists in folder")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, 10024, "failed to move node")
+			return
+		}
+	default:
+		writeError(w, http.StatusBadRequest, 10027, "unsupported node_type")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Message: "moved"})
 }
 
 // downloadHandler 第二步新增：按 id 找到磁盘文件并以附件方式下载。
@@ -569,7 +851,7 @@ func deleteHandler(w http.ResponseWriter, _ *http.Request, id string, ownerID in
 }
 
 // saveUploadedFile 第二步新增：生成 id -> 流式写入磁盘 -> 建立内存索引。
-func saveUploadedFile(src multipart.File, hdr *multipart.FileHeader, ownerID int64) (*fileRecord, error) {
+func saveUploadedFile(src multipart.File, hdr *multipart.FileHeader, ownerID int64, parentID *int64) (*fileRecord, error) {
 	id, err := generateID() // 生成随机文件 id
 	if err != nil {
 		return nil, err
@@ -599,6 +881,7 @@ func saveUploadedFile(src multipart.File, hdr *multipart.FileHeader, ownerID int
 		SizeBytes: size,
 		CreatedAt: time.Now(),
 		OwnerID:   ownerID,
+		ParentID:  parentID,
 		DiskPath:  diskPath,
 	}
 
@@ -648,6 +931,319 @@ func parseFileAction(path string) (id string, action string, err error) {
 		return parts[0], parts[1], nil
 	}
 	return "", "", os.ErrNotExist
+}
+
+func parseFolderAction(path string) (id int64, action string, err error) {
+	const prefix = "/api/v1/folders/"
+	if !strings.HasPrefix(path, prefix) {
+		return 0, "", os.ErrNotExist
+	}
+
+	rest := strings.Trim(strings.TrimPrefix(path, prefix), "/")
+	parts := strings.Split(rest, "/")
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		return 0, "", os.ErrNotExist
+	}
+
+	id, err = strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, "", os.ErrNotExist
+	}
+
+	if len(parts) == 1 {
+		return id, "", nil
+	}
+	if len(parts) == 2 {
+		return id, parts[1], nil
+	}
+	return 0, "", os.ErrNotExist
+}
+
+func parseOptionalInt64(raw string) (*int64, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
+func int64Value(v *int64) interface{} {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+func getFolderByIDForOwner(ownerID int64, folderID int64) (*folderRecord, error) {
+	var rec folderRecord
+	var parentID sql.NullInt64
+	var createdAtUnix int64
+
+	err := dbConn.QueryRow(
+		"SELECT id, name, owner_id, parent_id, created_at_unix FROM folders WHERE id = ? AND owner_id = ?",
+		folderID,
+		ownerID,
+	).Scan(&rec.ID, &rec.Name, &rec.OwnerID, &parentID, &createdAtUnix)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, os.ErrNotExist
+		}
+		return nil, err
+	}
+	rec.CreatedAt = time.Unix(createdAtUnix, 0)
+	if parentID.Valid {
+		v := parentID.Int64
+		rec.ParentID = &v
+	}
+	return &rec, nil
+}
+
+func createFolderInDB(ownerID int64, name string, parentID *int64) (int64, error) {
+	result, err := dbConn.Exec(
+		"INSERT INTO folders(owner_id, name, parent_id, created_at_unix, updated_at_unix) VALUES (?, ?, ?, ?, ?)",
+		ownerID,
+		name,
+		int64Value(parentID),
+		time.Now().Unix(),
+		time.Now().Unix(),
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+func updateFolderNameInDB(ownerID int64, folderID int64, name string) error {
+	result, err := dbConn.Exec(
+		"UPDATE folders SET name = ?, updated_at_unix = ? WHERE id = ? AND owner_id = ?",
+		name,
+		time.Now().Unix(),
+		folderID,
+		ownerID,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return os.ErrNotExist
+	}
+	return nil
+}
+
+func deleteFolderInDB(ownerID int64, folderID int64) error {
+	result, err := dbConn.Exec("DELETE FROM folders WHERE id = ? AND owner_id = ?", folderID, ownerID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return os.ErrNotExist
+	}
+	return nil
+}
+
+func hasChildrenInFolder(ownerID int64, folderID int64) (bool, error) {
+	var countFolders int64
+	if err := dbConn.QueryRow(
+		"SELECT COUNT(1) FROM folders WHERE owner_id = ? AND parent_id = ?",
+		ownerID,
+		folderID,
+	).Scan(&countFolders); err != nil {
+		return false, err
+	}
+	if countFolders > 0 {
+		return true, nil
+	}
+
+	var countFiles int64
+	if err := dbConn.QueryRow(
+		"SELECT COUNT(1) FROM files WHERE owner_id = ? AND parent_folder_id = ?",
+		ownerID,
+		folderID,
+	).Scan(&countFiles); err != nil {
+		return false, err
+	}
+	return countFiles > 0, nil
+}
+
+func siblingNameExists(ownerID int64, parentID *int64, name string, excludeFolderID *int64, excludeFileID *string) (bool, error) {
+	parent := int64Value(parentID)
+
+	queryFolders := "SELECT COUNT(1) FROM folders WHERE owner_id = ? AND name = ? AND ((parent_id IS NULL AND ? IS NULL) OR parent_id = ?)"
+	argsFolders := []interface{}{ownerID, name, parent, parent}
+	if excludeFolderID != nil {
+		queryFolders += " AND id <> ?"
+		argsFolders = append(argsFolders, *excludeFolderID)
+	}
+	var folderCount int64
+	if err := dbConn.QueryRow(queryFolders, argsFolders...).Scan(&folderCount); err != nil {
+		return false, err
+	}
+	if folderCount > 0 {
+		return true, nil
+	}
+
+	queryFiles := "SELECT COUNT(1) FROM files WHERE owner_id = ? AND name = ? AND ((parent_folder_id IS NULL AND ? IS NULL) OR parent_folder_id = ?)"
+	argsFiles := []interface{}{ownerID, name, parent, parent}
+	if excludeFileID != nil {
+		queryFiles += " AND id <> ?"
+		argsFiles = append(argsFiles, *excludeFileID)
+	}
+	var fileCount int64
+	if err := dbConn.QueryRow(queryFiles, argsFiles...).Scan(&fileCount); err != nil {
+		return false, err
+	}
+
+	return fileCount > 0, nil
+}
+
+func listChildrenInFolder(ownerID int64, folderID int64) ([]map[string]interface{}, error) {
+	items := make([]map[string]interface{}, 0)
+
+	fRows, err := dbConn.Query(
+		"SELECT id, name, created_at_unix FROM folders WHERE owner_id = ? AND parent_id = ? ORDER BY name ASC",
+		ownerID,
+		folderID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer fRows.Close()
+
+	for fRows.Next() {
+		var id int64
+		var name string
+		var created int64
+		if err := fRows.Scan(&id, &name, &created); err != nil {
+			return nil, err
+		}
+		parentCopy := folderID
+		items = append(items, map[string]interface{}{
+			"type":       "folder",
+			"id":         id,
+			"name":       name,
+			"parent_id":  &parentCopy,
+			"created_at": time.Unix(created, 0),
+		})
+	}
+	if err := fRows.Err(); err != nil {
+		return nil, err
+	}
+
+	filesMu.RLock()
+	for _, rec := range filesByID {
+		if rec.OwnerID != ownerID {
+			continue
+		}
+		if rec.ParentID == nil || *rec.ParentID != folderID {
+			continue
+		}
+		items = append(items, map[string]interface{}{
+			"type":         "file",
+			"id":           rec.ID,
+			"name":         rec.Name,
+			"size_bytes":   rec.SizeBytes,
+			"parent_id":    rec.ParentID,
+			"created_at":   rec.CreatedAt,
+			"download_url": "/api/v1/files/" + rec.ID + "/download",
+		})
+	}
+	filesMu.RUnlock()
+
+	return items, nil
+}
+
+func moveFileNode(ownerID int64, fileID string, targetParentID *int64) error {
+	filesMu.Lock()
+	rec, ok := filesByID[fileID]
+	if !ok || rec.OwnerID != ownerID {
+		filesMu.Unlock()
+		return os.ErrNotExist
+	}
+
+	exists, err := siblingNameExists(ownerID, targetParentID, rec.Name, nil, &fileID)
+	if err != nil {
+		filesMu.Unlock()
+		return err
+	}
+	if exists {
+		filesMu.Unlock()
+		return errNameConflict
+	}
+
+	if err := moveFileToFolderInDB(fileID, ownerID, targetParentID); err != nil {
+		filesMu.Unlock()
+		return err
+	}
+	rec.ParentID = targetParentID
+	filesMu.Unlock()
+	return nil
+}
+
+func moveFolderNode(ownerID int64, folderID int64, targetParentID *int64) error {
+	folder, err := getFolderByIDForOwner(ownerID, folderID)
+	if err != nil {
+		return err
+	}
+
+	if targetParentID != nil {
+		if *targetParentID == folderID {
+			return errInvalidMove
+		}
+		if _, err := getFolderByIDForOwner(ownerID, *targetParentID); err != nil {
+			return os.ErrNotExist
+		}
+		if isDesc, err := isDescendantFolder(ownerID, folderID, *targetParentID); err != nil {
+			return err
+		} else if isDesc {
+			return errInvalidMove
+		}
+	}
+
+	exists, err := siblingNameExists(ownerID, targetParentID, folder.Name, &folderID, nil)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return errNameConflict
+	}
+
+	return moveFolderToParentInDB(ownerID, folderID, targetParentID)
+}
+
+func isDescendantFolder(ownerID int64, ancestorID int64, candidateID int64) (bool, error) {
+	current := &candidateID
+	for current != nil {
+		if *current == ancestorID {
+			return true, nil
+		}
+
+		var parent sql.NullInt64
+		err := dbConn.QueryRow("SELECT parent_id FROM folders WHERE id = ? AND owner_id = ?", *current, ownerID).Scan(&parent)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, os.ErrNotExist
+			}
+			return false, err
+		}
+		if parent.Valid {
+			v := parent.Int64
+			current = &v
+		} else {
+			current = nil
+		}
+	}
+	return false, nil
 }
 
 // generateID 第二步新增：生成 24 位十六进制随机 id。
@@ -715,7 +1311,17 @@ func initMySQL() (*sql.DB, error) {
 		  size_bytes BIGINT NOT NULL,
 		  created_at_unix BIGINT NOT NULL,
 		  owner_id BIGINT NULL,
+		  parent_folder_id BIGINT NULL,
 		  disk_path VARCHAR(1024) NOT NULL
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+		`CREATE TABLE IF NOT EXISTS folders (
+		  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+		  owner_id BIGINT NOT NULL,
+		  name VARCHAR(255) NOT NULL,
+		  parent_id BIGINT NULL,
+		  created_at_unix BIGINT NOT NULL,
+		  updated_at_unix BIGINT NOT NULL,
+		  INDEX idx_folders_owner_parent (owner_id, parent_id)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
 		`CREATE TABLE IF NOT EXISTS users (
 		  id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -756,12 +1362,25 @@ ADD COLUMN IF NOT EXISTS owner_id BIGINT NULL
 		}
 	}
 
+	const ensureParentFolderColumn = `
+ALTER TABLE files
+ADD COLUMN IF NOT EXISTS parent_folder_id BIGINT NULL
+`
+	if _, err := db.Exec(ensureParentFolderColumn); err != nil {
+		if _, err2 := db.Exec("ALTER TABLE files ADD COLUMN parent_folder_id BIGINT NULL"); err2 != nil {
+			if !strings.Contains(strings.ToLower(err2.Error()), "duplicate column") {
+				_ = db.Close()
+				return nil, err2
+			}
+		}
+	}
+
 	return db, nil
 }
 
 // loadFilesFromDB 启动时读取 MySQL 元数据并恢复到内存索引。
 func loadFilesFromDB() error {
-	rows, err := dbConn.Query("SELECT id, name, size_bytes, created_at_unix, owner_id, disk_path FROM files")
+	rows, err := dbConn.Query("SELECT id, name, size_bytes, created_at_unix, owner_id, parent_folder_id, disk_path FROM files")
 	if err != nil {
 		return err
 	}
@@ -773,13 +1392,14 @@ func loadFilesFromDB() error {
 		size      int64
 		createdAt int64
 		ownerID   sql.NullInt64
+		parentID  sql.NullInt64
 		diskPath  string
 	}
 
 	items := make([]rowData, 0)
 	for rows.Next() {
 		var r rowData
-		if err := rows.Scan(&r.id, &r.name, &r.size, &r.createdAt, &r.ownerID, &r.diskPath); err != nil {
+		if err := rows.Scan(&r.id, &r.name, &r.size, &r.createdAt, &r.ownerID, &r.parentID, &r.diskPath); err != nil {
 			return err
 		}
 		items = append(items, r)
@@ -801,12 +1421,19 @@ func loadFilesFromDB() error {
 			return err
 		}
 
+		var parentID *int64
+		if r.parentID.Valid {
+			v := r.parentID.Int64
+			parentID = &v
+		}
+
 		filesByID[r.id] = &fileRecord{
 			ID:        r.id,
 			Name:      r.name,
 			SizeBytes: r.size,
 			CreatedAt: time.Unix(r.createdAt, 0),
 			OwnerID:   r.ownerID.Int64,
+			ParentID:  parentID,
 			DiskPath:  r.diskPath,
 		}
 	}
@@ -816,12 +1443,13 @@ func loadFilesFromDB() error {
 
 func insertFileToDB(rec *fileRecord) error {
 	_, err := dbConn.Exec(
-		"INSERT INTO files(id, name, size_bytes, created_at_unix, owner_id, disk_path) VALUES (?, ?, ?, ?, ?, ?)",
+		"INSERT INTO files(id, name, size_bytes, created_at_unix, owner_id, parent_folder_id, disk_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
 		rec.ID,
 		rec.Name,
 		rec.SizeBytes,
 		rec.CreatedAt.Unix(),
 		rec.OwnerID,
+		int64Value(rec.ParentID),
 		rec.DiskPath,
 	)
 	return err
@@ -845,4 +1473,45 @@ func updateFileNameInDB(id string, ownerID int64, name string) error {
 func deleteFileFromDB(id string, ownerID int64) error {
 	_, err := dbConn.Exec("DELETE FROM files WHERE id = ? AND owner_id = ?", id, ownerID)
 	return err
+}
+
+func moveFileToFolderInDB(id string, ownerID int64, parentID *int64) error {
+	result, err := dbConn.Exec(
+		"UPDATE files SET parent_folder_id = ? WHERE id = ? AND owner_id = ?",
+		int64Value(parentID),
+		id,
+		ownerID,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return os.ErrNotExist
+	}
+	return nil
+}
+
+func moveFolderToParentInDB(ownerID int64, folderID int64, parentID *int64) error {
+	result, err := dbConn.Exec(
+		"UPDATE folders SET parent_id = ?, updated_at_unix = ? WHERE id = ? AND owner_id = ?",
+		int64Value(parentID),
+		time.Now().Unix(),
+		folderID,
+		ownerID,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return os.ErrNotExist
+	}
+	return nil
 }
