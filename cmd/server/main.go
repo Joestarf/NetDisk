@@ -708,38 +708,38 @@ func initMySQL() (*sql.DB, error) {
 		return nil, err
 	}
 
-	const ddl = `
-CREATE TABLE IF NOT EXISTS files (
-  id VARCHAR(64) PRIMARY KEY,
-  name VARCHAR(255) NOT NULL,
-  size_bytes BIGINT NOT NULL,
-  created_at_unix BIGINT NOT NULL,
-	owner_id BIGINT NULL,
-  disk_path VARCHAR(1024) NOT NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TABLE IF NOT EXISTS users (
-	id BIGINT PRIMARY KEY AUTO_INCREMENT,
-	username VARCHAR(128) NOT NULL,
-	password_salt VARCHAR(64) NOT NULL,
-	password_hash VARCHAR(128) NOT NULL,
-	created_at_unix BIGINT NOT NULL,
-	UNIQUE KEY uk_users_username (username)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TABLE IF NOT EXISTS auth_tokens (
-	token VARCHAR(128) PRIMARY KEY,
-	user_id BIGINT NOT NULL,
-	expires_at_unix BIGINT NOT NULL,
-	revoked TINYINT(1) NOT NULL DEFAULT 0,
-	created_at_unix BIGINT NOT NULL,
-	INDEX idx_auth_tokens_user_id (user_id),
-	INDEX idx_auth_tokens_expires_at (expires_at_unix)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-`
-	if _, err := db.Exec(ddl); err != nil {
-		_ = db.Close()
-		return nil, err
+	ddls := []string{
+		`CREATE TABLE IF NOT EXISTS files (
+		  id VARCHAR(64) PRIMARY KEY,
+		  name VARCHAR(255) NOT NULL,
+		  size_bytes BIGINT NOT NULL,
+		  created_at_unix BIGINT NOT NULL,
+		  owner_id BIGINT NULL,
+		  disk_path VARCHAR(1024) NOT NULL
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+		`CREATE TABLE IF NOT EXISTS users (
+		  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+		  username VARCHAR(128) NOT NULL,
+		  password_salt VARCHAR(64) NOT NULL,
+		  password_hash VARCHAR(128) NOT NULL,
+		  created_at_unix BIGINT NOT NULL,
+		  UNIQUE KEY uk_users_username (username)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+		`CREATE TABLE IF NOT EXISTS auth_tokens (
+		  token VARCHAR(128) PRIMARY KEY,
+		  user_id BIGINT NOT NULL,
+		  expires_at_unix BIGINT NOT NULL,
+		  revoked TINYINT(1) NOT NULL DEFAULT 0,
+		  created_at_unix BIGINT NOT NULL,
+		  INDEX idx_auth_tokens_user_id (user_id),
+		  INDEX idx_auth_tokens_expires_at (expires_at_unix)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+	}
+	for _, ddl := range ddls {
+		if _, err := db.Exec(ddl); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 
 	const ensureOwnerColumn = `
