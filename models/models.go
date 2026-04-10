@@ -29,6 +29,25 @@ type FolderRecord struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// ShareRecord 分享记录模型
+type ShareRecord struct {
+	ID            int64     `json:"id"`
+	Token         string    `json:"token"`
+	OwnerID       int64     `json:"owner_id"`
+	NodeType      string    `json:"node_type"`
+	NodeID        string    `json:"node_id"`
+	Name          string    `json:"name"`
+	PasswordHash  *string   `json:"-"`
+	ExpiresAtUnix *int64    `json:"expires_at_unix,omitempty"`
+	MaxVisits     *int      `json:"max_visits,omitempty"`
+	VisitCount    int       `json:"visit_count"`
+	Revoked       bool      `json:"revoked"`
+	CreatedAtUnix int64     `json:"created_at_unix"`
+	UpdatedAtUnix int64     `json:"updated_at_unix"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
 // AuthUser 认证后的用户信息
 type AuthUser struct {
 	ID       int64  `json:"id"`

@@ -46,6 +46,11 @@ func main() {
 	http.HandleFunc("/api/v1/folders/", middleware.AuthMiddleware(handlers.FolderItemHandler))
 	http.HandleFunc("/api/v1/nodes/move", middleware.AuthMiddleware(handlers.MoveNodeHandler))
 
+	// 分享接口
+	http.HandleFunc("/api/v1/shares", middleware.AuthMiddleware(handlers.SharesCollectionHandler))
+	http.HandleFunc("/api/v1/shares/", middleware.AuthMiddleware(handlers.ShareItemHandler))
+	http.HandleFunc("/s/", handlers.PublicShareHandler)
+
 	log.Printf("server is starting at :%s", cfg.Port)
 	if err := http.ListenAndServe(":"+cfg.Port, nil); err != nil {
 		log.Fatalf("server failed: %v", err)

@@ -212,6 +212,10 @@ func deleteHandler(w http.ResponseWriter, _ *http.Request, id string, ownerID in
 		utils.WriteError(w, http.StatusInternalServerError, 10009, "failed to persist file metadata")
 		return
 	}
+	if err := db.RevokeSharesByNode(ownerID, "file", id); err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10030, "failed to update related shares")
+		return
+	}
 
 	db.FilesMu.Lock()
 	delete(db.FilesByID, id)

@@ -22,9 +22,10 @@ func WriteJSON(w http.ResponseWriter, status int, body models.APIResponse) {
 
 // WriteError 写入错误响应
 func WriteError(w http.ResponseWriter, status int, code int, message string) {
-	WriteJSON(w, status, models.APIResponse{Code: code, Message: message})
+    // 强制设置一个安全的文件名，防止泄露 URL 中的 token
+    w.Header().Set("Content-Disposition", `attachment; filename="error.json"`)
+    WriteJSON(w, status, models.APIResponse{Code: code, Message: message})
 }
-
 // GenerateID 生成 24 位十六进制随机 ID
 func GenerateID() (string, error) {
 	b := make([]byte, 12) // 12 字节 = 24 位十六进制字符串

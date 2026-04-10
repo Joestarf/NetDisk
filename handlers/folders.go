@@ -185,6 +185,10 @@ func deleteFolderHandler(w http.ResponseWriter, _ *http.Request, ownerID int64, 
 		utils.WriteError(w, http.StatusInternalServerError, 10021, "failed to delete folder")
 		return
 	}
+	if err := db.RevokeSharesByNode(ownerID, "folder", strconv.FormatInt(folderID, 10)); err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10030, "failed to update related shares")
+		return
+	}
 
 	utils.WriteJSON(w, http.StatusOK, models.APIResponse{Code: 0, Message: "folder deleted"})
 }

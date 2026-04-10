@@ -85,6 +85,24 @@ func initTables() error {
 		  INDEX idx_auth_tokens_user_id (user_id),
 		  INDEX idx_auth_tokens_expires_at (expires_at_unix)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+		`CREATE TABLE IF NOT EXISTS shares (
+		  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+		  token VARCHAR(64) UNIQUE NOT NULL,
+		  owner_id BIGINT NOT NULL,
+		  node_type ENUM('file', 'folder') NOT NULL,
+		  node_id VARCHAR(128) NOT NULL,
+		  name VARCHAR(255) NOT NULL,
+		  password_hash VARCHAR(128) DEFAULT NULL,
+		  expires_at_unix BIGINT DEFAULT NULL,
+		  max_visits INT DEFAULT NULL,
+		  visit_count INT NOT NULL DEFAULT 0,
+		  revoked TINYINT(1) NOT NULL DEFAULT 0,
+		  created_at_unix BIGINT NOT NULL,
+		  updated_at_unix BIGINT NOT NULL,
+		  INDEX idx_shares_token (token),
+		  INDEX idx_shares_owner_id (owner_id),
+		  INDEX idx_shares_node (node_type, node_id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
 	}
 
 	for _, ddl := range ddls {
@@ -194,4 +212,226 @@ func Close() error {
 		return DB.Close()
 	}
 	return nil
+}
+
+// CreateShare 插入一条分享记录
+func CreateShare(share *models.ShareRecord) (int64, error) {
+	result, err := DB.Exec(
+		`INSERT INTO shares(
+			token, owner_id, node_type, node_id, name, password_hash,
+			expires_at_unix, max_visits, visit_count, revoked,
+			created_at_unix, updated_at_unix
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		share.Token,
+		share.OwnerID,
+		share.NodeType,
+		share.NodeID,
+		share.Name,
+		share.PasswordHash,
+		share.ExpiresAtUnix,
+		share.MaxVisits,
+		share.VisitCount,
+		share.Revoked,
+		share.CreatedAtUnix,
+		share.UpdatedAtUnix,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+// ListSharesByOwner 查询用户创建的分享
+func ListSharesByOwner(ownerID int64) ([]models.ShareRecord, error) {
+	rows, err := DB.Query(
+		`SELECT id, token, owner_id, node_type, node_id, name, password_hash,
+			expires_at_unix, max_visits, visit_count, revoked,
+			created_at_unix, updated_at_unix
+		 FROM shares
+		 WHERE owner_id = ?
+		 ORDER BY id DESC`,
+		ownerID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]models.ShareRecord, 0)
+	for rows.Next() {
+		var share models.ShareRecord
+		var passwordHash sql.NullString
+		var expiresAt sql.NullInt64
+		var maxVisits sql.NullInt64
+		var revoked int64
+		if err := rows.Scan(
+			&share.ID,
+			&share.Token,
+			&share.OwnerID,
+			&share.NodeType,
+			&share.NodeID,
+			&share.Name,
+			&passwordHash,
+			&expiresAt,
+			&maxVisits,
+			&share.VisitCount,
+			&revoked,
+			&share.CreatedAtUnix,
+			&share.UpdatedAtUnix,
+		); err != nil {
+			return nil, err
+		}
+		if passwordHash.Valid {
+			v := passwordHash.String
+			share.PasswordHash = &v
+		}
+		if expiresAt.Valid {
+			v := expiresAt.Int64
+			share.ExpiresAtUnix = &v
+		}
+		if maxVisits.Valid {
+			v := int(maxVisits.Int64)
+			share.MaxVisits = &v
+		}
+		share.Revoked = revoked != 0
+		share.CreatedAt = time.Unix(share.CreatedAtUnix, 0)
+		share.UpdatedAt = time.Unix(share.UpdatedAtUnix, 0)
+		items = append(items, share)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return items, nil
+}
+
+// GetShareByToken 按 token 获取分享
+func GetShareByToken(token string) (*models.ShareRecord, error) {
+	var share models.ShareRecord
+	var passwordHash sql.NullString
+	var expiresAt sql.NullInt64
+	var maxVisits sql.NullInt64
+	var revoked int64
+	err := DB.QueryRow(
+		`SELECT id, token, owner_id, node_type, node_id, name, password_hash,
+			expires_at_unix, max_visits, visit_count, revoked,
+			created_at_unix, updated_at_unix
+		 FROM shares
+		 WHERE token = ?`,
+		token,
+	).Scan(
+		&share.ID,
+		&share.Token,
+		&share.OwnerID,
+		&share.NodeType,
+		&share.NodeID,
+		&share.Name,
+		&passwordHash,
+		&expiresAt,
+		&maxVisits,
+		&share.VisitCount,
+		&revoked,
+		&share.CreatedAtUnix,
+		&share.UpdatedAtUnix,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, os.ErrNotExist
+		}
+		return nil, err
+	}
+	if passwordHash.Valid {
+		v := passwordHash.String
+		share.PasswordHash = &v
+	}
+	if expiresAt.Valid {
+		v := expiresAt.Int64
+		share.ExpiresAtUnix = &v
+	}
+	if maxVisits.Valid {
+		v := int(maxVisits.Int64)
+		share.MaxVisits = &v
+	}
+	share.Revoked = revoked != 0
+	share.CreatedAt = time.Unix(share.CreatedAtUnix, 0)
+	share.UpdatedAt = time.Unix(share.UpdatedAtUnix, 0)
+	return &share, nil
+}
+
+// DeleteShareByID 删除用户自己的分享
+func DeleteShareByID(ownerID int64, shareID int64) error {
+	result, err := DB.Exec("DELETE FROM shares WHERE id = ? AND owner_id = ?", shareID, ownerID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return os.ErrNotExist
+	}
+	return nil
+}
+
+// IncrementShareVisitByToken 记录一次成功访问
+func IncrementShareVisitByToken(token string) error {
+	result, err := DB.Exec(
+		`UPDATE shares
+		 SET visit_count = visit_count + 1,
+		     updated_at_unix = ?
+		 WHERE token = ?`,
+		time.Now().Unix(),
+		token,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return os.ErrNotExist
+	}
+	return nil
+}
+
+// RevokeShareByID 标记分享为失效
+func RevokeShareByID(ownerID int64, shareID int64) error {
+	result, err := DB.Exec(
+		`UPDATE shares
+		 SET revoked = 1,
+		     updated_at_unix = ?
+		 WHERE id = ? AND owner_id = ?`,
+		time.Now().Unix(),
+		shareID,
+		ownerID,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return os.ErrNotExist
+	}
+	return nil
+}
+
+// RevokeSharesByNode 删除资源后，批量标记关联分享失效。
+func RevokeSharesByNode(ownerID int64, nodeType string, nodeID string) error {
+	_, err := DB.Exec(
+		`UPDATE shares
+		 SET revoked = 1,
+		     updated_at_unix = ?
+		 WHERE owner_id = ? AND node_type = ? AND node_id = ?`,
+		time.Now().Unix(),
+		ownerID,
+		nodeType,
+		nodeID,
+	)
+	return err
 }
