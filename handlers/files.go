@@ -1,6 +1,9 @@
 package handlers
 
 import (
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -194,27 +197,80 @@ func renameHandler(w http.ResponseWriter, r *http.Request, id string, ownerID in
 }
 
 func deleteHandler(w http.ResponseWriter, _ *http.Request, id string, ownerID int64) {
-	db.FilesMu.RLock()
-	rec, ok := db.FilesByID[id]
-	if !ok || rec.OwnerID != ownerID {
-		db.FilesMu.RUnlock()
-		utils.WriteError(w, http.StatusNotFound, 10005, "file not found")
-		return
-	}
-	db.FilesMu.RUnlock()
-
-	if err := os.Remove(rec.DiskPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		utils.WriteError(w, http.StatusInternalServerError, 10008, "failed to delete file from disk")
-		return
-	}
-
-	if err := deleteFileFromDB(id, ownerID); err != nil {
+	tx, err := db.DB.Begin()
+	if err != nil {
 		utils.WriteError(w, http.StatusInternalServerError, 10009, "failed to persist file metadata")
 		return
 	}
-	if err := db.RevokeSharesByNode(ownerID, "file", id); err != nil {
+	defer tx.Rollback()
+
+	var diskPath string
+	var blobHash sql.NullString
+	err = tx.QueryRow(
+		"SELECT disk_path, blob_hash FROM files WHERE id = ? AND owner_id = ? FOR UPDATE",
+		id,
+		ownerID,
+	).Scan(&diskPath, &blobHash)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			utils.WriteError(w, http.StatusNotFound, 10005, "file not found")
+			return
+		}
+		utils.WriteError(w, http.StatusInternalServerError, 10009, "failed to persist file metadata")
+		return
+	}
+
+	if _, err := tx.Exec("DELETE FROM files WHERE id = ? AND owner_id = ?", id, ownerID); err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10009, "failed to persist file metadata")
+		return
+	}
+
+	if _, err := tx.Exec(
+		`UPDATE shares SET revoked = 1, updated_at_unix = ?
+		 WHERE owner_id = ? AND node_type = 'file' AND node_id = ?`,
+		time.Now().Unix(),
+		ownerID,
+		id,
+	); err != nil {
 		utils.WriteError(w, http.StatusInternalServerError, 10030, "failed to update related shares")
 		return
+	}
+
+	removePath := ""
+	if blobHash.Valid && strings.TrimSpace(blobHash.String) != "" {
+		var blobDiskPath string
+		err = tx.QueryRow("SELECT disk_path FROM file_blobs WHERE hash = ? FOR UPDATE", blobHash.String).Scan(&blobDiskPath)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			utils.WriteError(w, http.StatusInternalServerError, 10009, "failed to persist file metadata")
+			return
+		}
+
+		_, shouldDelete, err := db.DecrementBlobRefCount(tx, blobHash.String)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			utils.WriteError(w, http.StatusInternalServerError, 10009, "failed to persist file metadata")
+			return
+		}
+		if shouldDelete {
+			if err := db.DeleteBlob(tx, blobHash.String); err != nil {
+				utils.WriteError(w, http.StatusInternalServerError, 10009, "failed to persist file metadata")
+				return
+			}
+			removePath = blobDiskPath
+		}
+	} else {
+		removePath = diskPath
+	}
+
+	if err := tx.Commit(); err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10009, "failed to persist file metadata")
+		return
+	}
+
+	if removePath != "" {
+		if err := os.Remove(removePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			utils.WriteError(w, http.StatusInternalServerError, 10008, "failed to delete file from disk")
+			return
+		}
 	}
 
 	db.FilesMu.Lock()
@@ -237,17 +293,65 @@ func saveUploadedFile(src multipart.File, hdr *multipart.FileHeader, ownerID int
 	if name == "" {
 		name = "unnamed"
 	}
-	ext := filepath.Ext(name)
-	diskPath := filepath.Join(storageDir, id+ext)
-
-	dst, err := os.Create(diskPath)
+	tmpFile, err := os.CreateTemp(storageDir, "upload-*.tmp")
 	if err != nil {
 		return nil, err
 	}
-	defer dst.Close()
+	tmpPath := tmpFile.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
 
-	size, err := io.Copy(dst, src)
+	hasher := sha256.New()
+	teeReader := io.TeeReader(src, hasher)
+	size, err := io.Copy(tmpFile, teeReader)
 	if err != nil {
+		_ = tmpFile.Close()
+		return nil, err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return nil, err
+	}
+
+	hash := hex.EncodeToString(hasher.Sum(nil))
+	blobHash := hash
+	diskPath := filepath.Join(storageDir, hash)
+
+	tx, err := db.DB.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var existingPath string
+	err = tx.QueryRow("SELECT disk_path FROM file_blobs WHERE hash = ? FOR UPDATE", hash).Scan(&existingPath)
+	if err == nil {
+		diskPath = existingPath
+		if err := db.IncrementBlobRefCount(tx, hash); err != nil {
+			return nil, err
+		}
+	} else if errors.Is(err, sql.ErrNoRows) {
+		if err := os.Rename(tmpPath, diskPath); err != nil {
+			if _, statErr := os.Stat(diskPath); statErr == nil {
+				diskPath = filepath.Clean(diskPath)
+			} else {
+				return nil, err
+			}
+		}
+		cleanupTmp = false
+		if err := db.CreateBlob(tx, hash, size, diskPath); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "duplicate") {
+				if err := db.IncrementBlobRefCount(tx, hash); err != nil {
+					return nil, err
+				}
+			} else {
+				return nil, err
+			}
+		}
+	} else {
 		return nil, err
 	}
 
@@ -259,14 +363,18 @@ func saveUploadedFile(src multipart.File, hdr *multipart.FileHeader, ownerID int
 		OwnerID:   ownerID,
 		ParentID:  parentID,
 		DiskPath:  diskPath,
+		BlobHash:  &blobHash,
+	}
+
+	if err := insertFileToDBTx(tx, rec); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 
 	db.FilesMu.Lock()
-	if err := insertFileToDB(rec); err != nil {
-		db.FilesMu.Unlock()
-		_ = os.Remove(diskPath)
-		return nil, err
-	}
 	db.FilesByID[id] = rec
 	db.FilesMu.Unlock()
 
@@ -284,8 +392,12 @@ func GetFileRecordForOwner(id string, ownerID int64) (*models.FileRecord, error)
 }
 
 func insertFileToDB(rec *models.FileRecord) error {
+	var blobHash interface{}
+	if rec.BlobHash != nil {
+		blobHash = *rec.BlobHash
+	}
 	_, err := db.DB.Exec(
-		"INSERT INTO files(id, name, size_bytes, created_at_unix, owner_id, parent_folder_id, disk_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		"INSERT INTO files(id, name, size_bytes, created_at_unix, owner_id, parent_folder_id, disk_path, blob_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
 		rec.ID,
 		rec.Name,
 		rec.SizeBytes,
@@ -293,6 +405,26 @@ func insertFileToDB(rec *models.FileRecord) error {
 		rec.OwnerID,
 		utils.Int64Value(rec.ParentID),
 		rec.DiskPath,
+		blobHash,
+	)
+	return err
+}
+
+func insertFileToDBTx(tx *sql.Tx, rec *models.FileRecord) error {
+	var blobHash interface{}
+	if rec.BlobHash != nil {
+		blobHash = *rec.BlobHash
+	}
+	_, err := tx.Exec(
+		"INSERT INTO files(id, name, size_bytes, created_at_unix, owner_id, parent_folder_id, disk_path, blob_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		rec.ID,
+		rec.Name,
+		rec.SizeBytes,
+		rec.CreatedAt.Unix(),
+		rec.OwnerID,
+		utils.Int64Value(rec.ParentID),
+		rec.DiskPath,
+		blobHash,
 	)
 	return err
 }

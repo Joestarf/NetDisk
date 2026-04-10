@@ -57,7 +57,9 @@ func initTables() error {
 		  created_at_unix BIGINT NOT NULL,
 		  owner_id BIGINT NULL,
 		  parent_folder_id BIGINT NULL,
-		  disk_path VARCHAR(1024) NOT NULL
+		  disk_path VARCHAR(1024) NOT NULL,
+		  blob_hash VARCHAR(64) DEFAULT NULL,
+		  INDEX idx_files_blob_hash (blob_hash)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
 		`CREATE TABLE IF NOT EXISTS folders (
 		  id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -104,6 +106,14 @@ func initTables() error {
 		  INDEX idx_shares_owner_id (owner_id),
 		  INDEX idx_shares_node (node_type, node_id)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+		`CREATE TABLE IF NOT EXISTS file_blobs (
+		  hash VARCHAR(64) PRIMARY KEY,
+		  size_bytes BIGINT NOT NULL,
+		  disk_path VARCHAR(1024) NOT NULL,
+		  ref_count INT NOT NULL DEFAULT 1,
+		  created_at_unix BIGINT NOT NULL,
+		  updated_at_unix BIGINT NOT NULL
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
 	}
 
 	for _, ddl := range ddls {
@@ -141,6 +151,35 @@ ADD COLUMN IF NOT EXISTS parent_folder_id BIGINT NULL
 		}
 	}
 
+	// 确保 files.blob_hash 列存在
+	const ensureBlobHashColumn = `
+ALTER TABLE files
+ADD COLUMN IF NOT EXISTS blob_hash VARCHAR(64) DEFAULT NULL
+`
+	if _, err := DB.Exec(ensureBlobHashColumn); err != nil {
+		if _, err2 := DB.Exec("ALTER TABLE files ADD COLUMN blob_hash VARCHAR(64) DEFAULT NULL"); err2 != nil {
+			if !strings.Contains(strings.ToLower(err2.Error()), "duplicate column") {
+				_ = DB.Close()
+				return err2
+			}
+		}
+	}
+
+	// 确保 files.blob_hash 索引存在
+	const ensureBlobHashIndex = `
+ALTER TABLE files
+ADD INDEX IF NOT EXISTS idx_files_blob_hash (blob_hash)
+`
+	if _, err := DB.Exec(ensureBlobHashIndex); err != nil {
+		if _, err2 := DB.Exec("ALTER TABLE files ADD INDEX idx_files_blob_hash (blob_hash)"); err2 != nil {
+			errText := strings.ToLower(err2.Error())
+			if !strings.Contains(errText, "duplicate key") && !strings.Contains(errText, "already exists") {
+				_ = DB.Close()
+				return err2
+			}
+		}
+	}
+
 	// 确保 users.bio 列存在
 	const ensureBioColumn = `
 ALTER TABLE users
@@ -160,7 +199,7 @@ ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT NULL
 
 // LoadFilesFromDB 启动时从 MySQL 加载文件索引到内存
 func LoadFilesFromDB() error {
-	rows, err := DB.Query("SELECT id, name, size_bytes, created_at_unix, owner_id, parent_folder_id, disk_path FROM files")
+	rows, err := DB.Query("SELECT id, name, size_bytes, created_at_unix, owner_id, parent_folder_id, disk_path, blob_hash FROM files")
 	if err != nil {
 		return err
 	}
@@ -174,12 +213,13 @@ func LoadFilesFromDB() error {
 		ownerID   sql.NullInt64
 		parentID  sql.NullInt64
 		diskPath  string
+		blobHash  sql.NullString
 	}
 
 	items := make([]rowData, 0)
 	for rows.Next() {
 		var r rowData
-		if err := rows.Scan(&r.id, &r.name, &r.size, &r.createdAt, &r.ownerID, &r.parentID, &r.diskPath); err != nil {
+		if err := rows.Scan(&r.id, &r.name, &r.size, &r.createdAt, &r.ownerID, &r.parentID, &r.diskPath, &r.blobHash); err != nil {
 			return err
 		}
 		items = append(items, r)
@@ -207,6 +247,12 @@ func LoadFilesFromDB() error {
 			parentID = &v
 		}
 
+		var blobHash *string
+		if r.blobHash.Valid {
+			v := r.blobHash.String
+			blobHash = &v
+		}
+
 		FilesByID[r.id] = &models.FileRecord{
 			ID:        r.id,
 			Name:      r.name,
@@ -215,6 +261,7 @@ func LoadFilesFromDB() error {
 			OwnerID:   r.ownerID.Int64,
 			ParentID:  parentID,
 			DiskPath:  r.diskPath,
+			BlobHash:  blobHash,
 		}
 	}
 
@@ -451,6 +498,116 @@ func RevokeSharesByNode(ownerID int64, nodeType string, nodeID string) error {
 	return err
 }
 
+// GetBlobByHash 根据 hash 获取 blob 信息。
+func GetBlobByHash(hash string) (*models.FileBlob, error) {
+	return getBlobByHashTx(DB, hash)
+}
+
+func getBlobByHashTx(queryer interface {
+	QueryRow(query string, args ...interface{}) *sql.Row
+}, hash string) (*models.FileBlob, error) {
+	var blob models.FileBlob
+	err := queryer.QueryRow(
+		`SELECT hash, size_bytes, disk_path, ref_count, created_at_unix, updated_at_unix
+		 FROM file_blobs
+		 WHERE hash = ?`,
+		hash,
+	).Scan(
+		&blob.Hash,
+		&blob.SizeBytes,
+		&blob.DiskPath,
+		&blob.RefCount,
+		&blob.CreatedAtUnix,
+		&blob.UpdatedAtUnix,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, os.ErrNotExist
+		}
+		return nil, err
+	}
+	blob.CreatedAt = time.Unix(blob.CreatedAtUnix, 0)
+	blob.UpdatedAt = time.Unix(blob.UpdatedAtUnix, 0)
+	return &blob, nil
+}
+
+// CreateBlob 在事务内创建 blob 记录。
+func CreateBlob(tx *sql.Tx, hash string, size int64, diskPath string) error {
+	_, err := tx.Exec(
+		`INSERT INTO file_blobs(hash, size_bytes, disk_path, ref_count, created_at_unix, updated_at_unix)
+		 VALUES (?, ?, ?, 1, ?, ?)`,
+		hash,
+		size,
+		diskPath,
+		time.Now().Unix(),
+		time.Now().Unix(),
+	)
+	return err
+}
+
+// IncrementBlobRefCount 在事务内增加 blob 引用计数。
+func IncrementBlobRefCount(tx *sql.Tx, hash string) error {
+	result, err := tx.Exec(
+		`UPDATE file_blobs
+		 SET ref_count = ref_count + 1,
+		     updated_at_unix = ?
+		 WHERE hash = ?`,
+		time.Now().Unix(),
+		hash,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return os.ErrNotExist
+	}
+	return nil
+}
+
+// DecrementBlobRefCount 在事务内减少 blob 引用计数。
+func DecrementBlobRefCount(tx *sql.Tx, hash string) (int, bool, error) {
+	result, err := tx.Exec(
+		`UPDATE file_blobs
+		 SET ref_count = ref_count - 1,
+		     updated_at_unix = ?
+		 WHERE hash = ?`,
+		time.Now().Unix(),
+		hash,
+	)
+	if err != nil {
+		return 0, false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, false, err
+	}
+	if affected == 0 {
+		return 0, false, os.ErrNotExist
+	}
+
+	var refCount int
+	if err := tx.QueryRow("SELECT ref_count FROM file_blobs WHERE hash = ?", hash).Scan(&refCount); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, true, nil
+		}
+		return 0, false, err
+	}
+	if refCount <= 0 {
+		return refCount, true, nil
+	}
+	return refCount, false, nil
+}
+
+// DeleteBlob 在事务内删除 blob 记录。
+func DeleteBlob(tx *sql.Tx, hash string) error {
+	_, err := tx.Exec("DELETE FROM file_blobs WHERE hash = ?", hash)
+	return err
+}
+
 // DeleteUserCascade 事务删除用户及其关联数据。
 func DeleteUserCascade(userID int64) error {
 	tx, err := DB.Begin()
@@ -463,18 +620,19 @@ func DeleteUserCascade(userID int64) error {
 		return err
 	}
 
-	rows, err := tx.Query("SELECT id, disk_path FROM files WHERE owner_id = ?", userID)
+	rows, err := tx.Query("SELECT id, disk_path, blob_hash FROM files WHERE owner_id = ?", userID)
 	if err != nil {
 		return err
 	}
 	type fileInfo struct {
-		id   string
-		path string
+		id       string
+		path     string
+		blobHash sql.NullString
 	}
 	files := make([]fileInfo, 0)
 	for rows.Next() {
 		var f fileInfo
-		if err := rows.Scan(&f.id, &f.path); err != nil {
+		if err := rows.Scan(&f.id, &f.path, &f.blobHash); err != nil {
 			rows.Close()
 			return err
 		}
@@ -488,6 +646,58 @@ func DeleteUserCascade(userID int64) error {
 
 	if _, err := tx.Exec("DELETE FROM files WHERE owner_id = ?", userID); err != nil {
 		return err
+	}
+
+	blobRefDec := make(map[string]int)
+	blobDiskPath := make(map[string]string)
+	legacyPaths := make([]string, 0)
+	for _, f := range files {
+		if f.blobHash.Valid && strings.TrimSpace(f.blobHash.String) != "" {
+			h := f.blobHash.String
+			blobRefDec[h]++
+			if _, ok := blobDiskPath[h]; !ok {
+				blobDiskPath[h] = f.path
+			}
+		} else {
+			legacyPaths = append(legacyPaths, f.path)
+		}
+	}
+
+	deleteBlobPaths := make([]string, 0)
+	for hash, dec := range blobRefDec {
+		result, err := tx.Exec(
+			`UPDATE file_blobs
+			 SET ref_count = ref_count - ?,
+			     updated_at_unix = ?
+			 WHERE hash = ?`,
+			dec,
+			time.Now().Unix(),
+			hash,
+		)
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			continue
+		}
+
+		var refCount int
+		if err := tx.QueryRow("SELECT ref_count FROM file_blobs WHERE hash = ?", hash).Scan(&refCount); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return err
+		}
+		if refCount <= 0 {
+			if _, err := tx.Exec("DELETE FROM file_blobs WHERE hash = ?", hash); err != nil {
+				return err
+			}
+			deleteBlobPaths = append(deleteBlobPaths, blobDiskPath[hash])
+		}
 	}
 
 	if err := deleteAllFolders(tx, userID); err != nil {
@@ -515,8 +725,13 @@ func DeleteUserCascade(userID int64) error {
 	}
 
 	FilesMu.Lock()
+	for _, p := range legacyPaths {
+		_ = os.Remove(p)
+	}
+	for _, p := range deleteBlobPaths {
+		_ = os.Remove(p)
+	}
 	for _, f := range files {
-		_ = os.Remove(f.path)
 		delete(FilesByID, f.id)
 	}
 	FilesMu.Unlock()
