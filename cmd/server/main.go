@@ -38,6 +38,10 @@ func main() {
 	http.HandleFunc("/api/v1/users/me/password", middleware.AuthMiddleware(handlers.UpdatePasswordHandler))
 
 	// 文件接口
+	http.HandleFunc("/api/v1/files/upload/init", middleware.AuthMiddleware(handlers.ChunkUploadInitHandler))
+	http.HandleFunc("/api/v1/files/upload/chunk", middleware.AuthMiddleware(handlers.ChunkUploadPartHandler))
+	http.HandleFunc("/api/v1/files/upload/status", middleware.AuthMiddleware(handlers.ChunkUploadStatusHandler))
+	http.HandleFunc("/api/v1/files/upload/complete", middleware.AuthMiddleware(handlers.ChunkUploadCompleteHandler))
 	http.HandleFunc("/api/v1/files/upload", middleware.AuthMiddleware(handlers.UploadHandler))
 	http.HandleFunc("/api/v1/files", middleware.AuthMiddleware(handlers.FilesCollectionHandler))
 	http.HandleFunc("/api/v1/files/", middleware.AuthMiddleware(handlers.FileItemHandler))

@@ -6,11 +6,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +23,489 @@ import (
 	"netdisk/models"
 	"netdisk/utils"
 )
+
+type chunkUploadMeta struct {
+	OwnerID        int64  `json:"owner_id"`
+	Name           string `json:"name"`
+	ParentID       *int64 `json:"parent_id,omitempty"`
+	TotalChunks    int    `json:"total_chunks"`
+	TotalSizeBytes *int64 `json:"total_size_bytes,omitempty"`
+	CreatedAtUnix  int64  `json:"created_at_unix"`
+}
+
+func chunkRootDir() string {
+	return filepath.Join(config.DefaultStorageDir, ".chunks")
+}
+
+func chunkUploadDir(uploadID string) string {
+	return filepath.Join(chunkRootDir(), uploadID)
+}
+
+// ChunkUploadInitHandler 初始化分片上传会话
+func ChunkUploadInitHandler(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.CurrentUser(r)
+	if !ok {
+		utils.WriteError(w, http.StatusUnauthorized, 10010, "unauthorized")
+		return
+	}
+	if r.Method != http.MethodPost {
+		utils.WriteError(w, http.StatusMethodNotAllowed, 10001, "method not allowed")
+		return
+	}
+
+	var req struct {
+		Name           string `json:"name"`
+		ParentID       *int64 `json:"parent_id"`
+		TotalChunks    int    `json:"total_chunks"`
+		TotalSizeBytes *int64 `json:"total_size_bytes"`
+		FileHash       string `json:"file_hash"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.WriteError(w, http.StatusBadRequest, 10006, "invalid json body")
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.FileHash = strings.ToLower(strings.TrimSpace(req.FileHash))
+	if req.Name == "" || req.TotalChunks <= 0 {
+		utils.WriteError(w, http.StatusBadRequest, 10006, "invalid init params")
+		return
+	}
+	if req.TotalSizeBytes != nil && *req.TotalSizeBytes < 0 {
+		utils.WriteError(w, http.StatusBadRequest, 10006, "invalid total_size_bytes")
+		return
+	}
+	if req.FileHash != "" && !isValidSHA256Hex(req.FileHash) {
+		utils.WriteError(w, http.StatusBadRequest, 10006, "invalid file_hash")
+		return
+	}
+	if req.ParentID != nil {
+		if _, err := GetFolderByIDForOwner(user.ID, *req.ParentID); err != nil {
+			utils.WriteError(w, http.StatusBadRequest, 10016, "parent folder not found")
+			return
+		}
+	}
+
+	// 秒传：客户端给出哈希且服务端已存在 blob，则直接生成文件记录。
+	if req.FileHash != "" {
+		if _, err := db.GetBlobByHash(req.FileHash); err == nil {
+			rec, err := createFileByBlobHash(user.ID, req.Name, req.ParentID, req.FileHash)
+			if err == nil {
+				utils.WriteJSON(w, http.StatusCreated, models.APIResponse{
+					Code:    0,
+					Message: "instant uploaded",
+					Data: map[string]interface{}{
+						"instant":      true,
+						"id":           rec.ID,
+						"name":         rec.Name,
+						"size_bytes":   rec.SizeBytes,
+						"parent_id":    rec.ParentID,
+						"download_url": "/api/v1/files/" + rec.ID + "/download",
+					},
+				})
+				return
+			}
+			if !errors.Is(err, os.ErrNotExist) {
+				utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to init upload")
+				return
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to init upload")
+			return
+		}
+	}
+
+	uploadID, err := utils.GenerateID()
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to init upload")
+		return
+	}
+	dir := chunkUploadDir(uploadID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to init upload")
+		return
+	}
+
+	meta := chunkUploadMeta{
+		OwnerID:        user.ID,
+		Name:           req.Name,
+		ParentID:       req.ParentID,
+		TotalChunks:    req.TotalChunks,
+		TotalSizeBytes: req.TotalSizeBytes,
+		CreatedAtUnix:  time.Now().Unix(),
+	}
+	if err := writeChunkMeta(uploadID, meta); err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to init upload")
+		return
+	}
+
+	utils.WriteJSON(w, http.StatusOK, models.APIResponse{Code: 0, Message: "ok", Data: map[string]interface{}{"upload_id": uploadID}})
+}
+
+// ChunkUploadPartHandler 上传单个分片
+func ChunkUploadPartHandler(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.CurrentUser(r)
+	if !ok {
+		utils.WriteError(w, http.StatusUnauthorized, 10010, "unauthorized")
+		return
+	}
+	if r.Method != http.MethodPost {
+		utils.WriteError(w, http.StatusMethodNotAllowed, 10001, "method not allowed")
+		return
+	}
+
+	uploadID := strings.TrimSpace(r.FormValue("upload_id"))
+	idxRaw := strings.TrimSpace(r.FormValue("chunk_index"))
+	chunkIndex, err := strconv.Atoi(idxRaw)
+	if err != nil || chunkIndex < 0 {
+		utils.WriteError(w, http.StatusBadRequest, 10006, "invalid chunk_index")
+		return
+	}
+	meta, err := readChunkMeta(uploadID)
+	if err != nil {
+		utils.WriteError(w, http.StatusNotFound, 10004, "upload session not found")
+		return
+	}
+	if meta.OwnerID != user.ID {
+		utils.WriteError(w, http.StatusUnauthorized, 10010, "unauthorized")
+		return
+	}
+	if chunkIndex >= meta.TotalChunks {
+		utils.WriteError(w, http.StatusBadRequest, 10006, "chunk_index out of range")
+		return
+	}
+
+	src, _, err := r.FormFile("chunk")
+	if err != nil {
+		utils.WriteError(w, http.StatusBadRequest, 10002, "missing chunk form field")
+		return
+	}
+	defer src.Close()
+
+	dir := chunkUploadDir(uploadID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to save chunk")
+		return
+	}
+	partPath := filepath.Join(dir, fmt.Sprintf("%06d.part", chunkIndex))
+	tmpPath := partPath + ".tmp"
+	dst, err := os.Create(tmpPath)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to save chunk")
+		return
+	}
+	if _, err := io.Copy(dst, src); err != nil {
+		_ = dst.Close()
+		_ = os.Remove(tmpPath)
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to save chunk")
+		return
+	}
+	if err := dst.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to save chunk")
+		return
+	}
+	if err := os.Rename(tmpPath, partPath); err != nil {
+		_ = os.Remove(tmpPath)
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to save chunk")
+		return
+	}
+
+	utils.WriteJSON(w, http.StatusOK, models.APIResponse{Code: 0, Message: "chunk uploaded", Data: map[string]interface{}{"chunk_index": chunkIndex}})
+}
+
+// ChunkUploadStatusHandler 查询分片上传状态（已上传分片/缺失分片）
+func ChunkUploadStatusHandler(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.CurrentUser(r)
+	if !ok {
+		utils.WriteError(w, http.StatusUnauthorized, 10010, "unauthorized")
+		return
+	}
+	if r.Method != http.MethodGet {
+		utils.WriteError(w, http.StatusMethodNotAllowed, 10001, "method not allowed")
+		return
+	}
+
+	uploadID := strings.TrimSpace(r.URL.Query().Get("upload_id"))
+	meta, err := readChunkMeta(uploadID)
+	if err != nil {
+		utils.WriteError(w, http.StatusNotFound, 10004, "upload session not found")
+		return
+	}
+	if meta.OwnerID != user.ID {
+		utils.WriteError(w, http.StatusUnauthorized, 10010, "unauthorized")
+		return
+	}
+
+	uploaded, err := listUploadedChunkIndexes(uploadID)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to query upload status")
+		return
+	}
+	uploadedSet := make(map[int]struct{}, len(uploaded))
+	for _, idx := range uploaded {
+		uploadedSet[idx] = struct{}{}
+	}
+
+	missing := make([]int, 0)
+	for i := 0; i < meta.TotalChunks; i++ {
+		if _, ok := uploadedSet[i]; !ok {
+			missing = append(missing, i)
+		}
+	}
+
+	utils.WriteJSON(w, http.StatusOK, models.APIResponse{
+		Code:    0,
+		Message: "ok",
+		Data: map[string]interface{}{
+			"upload_id":       uploadID,
+			"name":            meta.Name,
+			"total_chunks":    meta.TotalChunks,
+			"uploaded_chunks": uploaded,
+			"missing_chunks":  missing,
+		},
+	})
+}
+
+// ChunkUploadCompleteHandler 合并分片并入库
+func ChunkUploadCompleteHandler(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.CurrentUser(r)
+	if !ok {
+		utils.WriteError(w, http.StatusUnauthorized, 10010, "unauthorized")
+		return
+	}
+	if r.Method != http.MethodPost {
+		utils.WriteError(w, http.StatusMethodNotAllowed, 10001, "method not allowed")
+		return
+	}
+
+	var req struct {
+		UploadID string `json:"upload_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.WriteError(w, http.StatusBadRequest, 10006, "invalid json body")
+		return
+	}
+	req.UploadID = strings.TrimSpace(req.UploadID)
+
+	meta, err := readChunkMeta(req.UploadID)
+	if err != nil {
+		utils.WriteError(w, http.StatusNotFound, 10004, "upload session not found")
+		return
+	}
+	if meta.OwnerID != user.ID {
+		utils.WriteError(w, http.StatusUnauthorized, 10010, "unauthorized")
+		return
+	}
+
+	merged, err := os.CreateTemp(config.DefaultStorageDir, "merge-*.tmp")
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to complete upload")
+		return
+	}
+	mergedPath := merged.Name()
+	cleanupMerged := true
+	defer func() {
+		if cleanupMerged {
+			_ = os.Remove(mergedPath)
+		}
+	}()
+
+	dir := chunkUploadDir(req.UploadID)
+	var mergedBytes int64
+	for i := 0; i < meta.TotalChunks; i++ {
+		partPath := filepath.Join(dir, fmt.Sprintf("%06d.part", i))
+		part, err := os.Open(partPath)
+		if err != nil {
+			_ = merged.Close()
+			utils.WriteError(w, http.StatusBadRequest, 10006, "missing chunk part")
+			return
+		}
+		n, err := io.Copy(merged, part)
+		if err != nil {
+			_ = part.Close()
+			_ = merged.Close()
+			utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to complete upload")
+			return
+		}
+		mergedBytes += n
+		_ = part.Close()
+	}
+	if meta.TotalSizeBytes != nil && mergedBytes != *meta.TotalSizeBytes {
+		_ = merged.Close()
+		utils.WriteError(w, http.StatusBadRequest, 10006, "chunk data size mismatch")
+		return
+	}
+	if err := merged.Close(); err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to complete upload")
+		return
+	}
+
+	src, err := os.Open(mergedPath)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to complete upload")
+		return
+	}
+	defer src.Close()
+
+	rec, err := saveUploadedFile(src, &multipart.FileHeader{Filename: meta.Name}, user.ID, meta.ParentID)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to save file")
+		return
+	}
+	cleanupMerged = false
+	_ = os.Remove(mergedPath)
+	_ = os.RemoveAll(dir)
+
+	utils.WriteJSON(w, http.StatusCreated, models.APIResponse{
+		Code:    0,
+		Message: "uploaded",
+		Data: map[string]interface{}{
+			"id":           rec.ID,
+			"name":         rec.Name,
+			"size_bytes":   rec.SizeBytes,
+			"parent_id":    rec.ParentID,
+			"download_url": "/api/v1/files/" + rec.ID + "/download",
+		},
+	})
+}
+
+func writeChunkMeta(uploadID string, meta chunkUploadMeta) error {
+	if !isValidUploadID(uploadID) {
+		return os.ErrInvalid
+	}
+	metaPath := filepath.Join(chunkUploadDir(uploadID), "meta.json")
+	b, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(metaPath, b, 0o644)
+}
+
+func readChunkMeta(uploadID string) (chunkUploadMeta, error) {
+	if !isValidUploadID(uploadID) {
+		return chunkUploadMeta{}, os.ErrNotExist
+	}
+	metaPath := filepath.Join(chunkUploadDir(uploadID), "meta.json")
+	b, err := os.ReadFile(metaPath)
+	if err != nil {
+		return chunkUploadMeta{}, err
+	}
+	var meta chunkUploadMeta
+	if err := json.Unmarshal(b, &meta); err != nil {
+		return chunkUploadMeta{}, err
+	}
+	return meta, nil
+}
+
+func isValidUploadID(uploadID string) bool {
+	uploadID = strings.TrimSpace(uploadID)
+	if uploadID == "" {
+		return false
+	}
+	if strings.Contains(uploadID, "/") || strings.Contains(uploadID, "\\") || strings.Contains(uploadID, "..") {
+		return false
+	}
+	return true
+}
+
+func listUploadedChunkIndexes(uploadID string) ([]int, error) {
+	dir := chunkUploadDir(uploadID)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []int{}, nil
+		}
+		return nil, err
+	}
+
+	indexes := make([]int, 0)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, ".part") {
+			continue
+		}
+		base := strings.TrimSuffix(name, ".part")
+		idx, err := strconv.Atoi(base)
+		if err != nil || idx < 0 {
+			continue
+		}
+		indexes = append(indexes, idx)
+	}
+	sort.Ints(indexes)
+	return indexes, nil
+}
+
+func isValidSHA256Hex(hash string) bool {
+	if len(hash) != 64 {
+		return false
+	}
+	for _, ch := range hash {
+		isNum := ch >= '0' && ch <= '9'
+		isHexLower := ch >= 'a' && ch <= 'f'
+		if !isNum && !isHexLower {
+			return false
+		}
+	}
+	return true
+}
+
+func createFileByBlobHash(ownerID int64, name string, parentID *int64, blobHash string) (*models.FileRecord, error) {
+	tx, err := db.DB.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var size int64
+	var diskPath string
+	err = tx.QueryRow("SELECT size_bytes, disk_path FROM file_blobs WHERE hash = ? FOR UPDATE", blobHash).Scan(&size, &diskPath)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, os.ErrNotExist
+		}
+		return nil, err
+	}
+
+	if err := db.IncrementBlobRefCount(tx, blobHash); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, os.ErrNotExist
+		}
+		return nil, err
+	}
+
+	id, err := utils.GenerateID()
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	blobHashCopy := blobHash
+	rec := &models.FileRecord{
+		ID:        id,
+		Name:      name,
+		SizeBytes: size,
+		CreatedAt: now,
+		OwnerID:   ownerID,
+		ParentID:  parentID,
+		DiskPath:  diskPath,
+		BlobHash:  &blobHashCopy,
+	}
+	if err := insertFileToDBTx(tx, rec); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	db.FilesMu.Lock()
+	db.FilesByID[id] = rec
+	db.FilesMu.Unlock()
+
+	return rec, nil
+}
 
 // UploadHandler 文件上传
 func UploadHandler(w http.ResponseWriter, r *http.Request) {
