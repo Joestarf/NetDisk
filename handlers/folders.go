@@ -1,11 +1,15 @@
 package handlers
 
 import (
+	"archive/zip"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -105,6 +109,12 @@ func FolderItemHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		renameFolderHandler(w, r, user.ID, id)
+	case action == "download" && r.Method == http.MethodGet:
+		if id == 0 {
+			utils.WriteError(w, http.StatusBadRequest, 10031, "root folder cannot be downloaded")
+			return
+		}
+		downloadFolderHandler(w, r, user.ID, id)
 	case action == "children" && r.Method == http.MethodGet:
 		folderChildrenHandler(w, r, user.ID, id)
 	case action == "" && r.Method == http.MethodDelete:
@@ -210,6 +220,99 @@ func folderChildrenHandler(w http.ResponseWriter, _ *http.Request, ownerID int64
 	}
 
 	utils.WriteJSON(w, http.StatusOK, models.APIResponse{Code: 0, Message: "ok", Data: children})
+}
+
+func downloadFolderHandler(w http.ResponseWriter, _ *http.Request, ownerID int64, folderID int64) {
+	folder, err := GetFolderByIDForOwner(ownerID, folderID)
+	if err != nil {
+		utils.WriteError(w, http.StatusNotFound, 10019, "folder not found")
+		return
+	}
+
+	zipName := folder.Name + ".zip"
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+zipName+"\"")
+	w.Header().Set("Content-Type", "application/zip")
+
+	zw := zip.NewWriter(w)
+	if err := addFolderToZip(zw, ownerID, folderID, folder.Name); err != nil {
+		_ = zw.Close()
+		return
+	}
+	_ = zw.Close()
+}
+
+func addFolderToZip(zw *zip.Writer, ownerID int64, folderID int64, basePath string) error {
+	if basePath != "" {
+		dirPath := path.Clean(basePath) + "/"
+		if _, err := zw.Create(dirPath); err != nil {
+			return err
+		}
+	}
+
+	children, err := listChildrenByParent(ownerID, &folderID)
+	if err != nil {
+		return err
+	}
+
+	for _, item := range children {
+		typeVal, _ := item["type"].(string)
+		switch typeVal {
+		case "folder":
+			subID, ok := item["id"].(int64)
+			if !ok {
+				return fmt.Errorf("invalid folder id type")
+			}
+			subName, ok := item["name"].(string)
+			if !ok {
+				return fmt.Errorf("invalid folder name type")
+			}
+			nextBase := path.Join(basePath, subName)
+			if err := addFolderToZip(zw, ownerID, subID, nextBase); err != nil {
+				return err
+			}
+		case "file":
+			fileID, ok := item["id"].(string)
+			if !ok {
+				return fmt.Errorf("invalid file id type")
+			}
+			fileName, ok := item["name"].(string)
+			if !ok {
+				return fmt.Errorf("invalid file name type")
+			}
+			rec, err := GetFileRecordForOwner(fileID, ownerID)
+			if err != nil {
+				return err
+			}
+			f, err := os.Open(rec.DiskPath)
+			if err != nil {
+				return err
+			}
+			info, err := f.Stat()
+			if err != nil {
+				_ = f.Close()
+				return err
+			}
+			h, err := zip.FileInfoHeader(info)
+			if err != nil {
+				_ = f.Close()
+				return err
+			}
+			h.Name = path.Join(basePath, fileName)
+			h.Method = zip.Deflate
+			w, err := zw.CreateHeader(h)
+			if err != nil {
+				_ = f.Close()
+				return err
+			}
+			if _, err := io.Copy(w, f); err != nil {
+				_ = f.Close()
+				return err
+			}
+			_ = f.Close()
+		}
+	}
+
+	return nil
 }
 
 // MoveNodeHandler 移动节点（文件或文件夹）
