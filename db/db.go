@@ -71,6 +71,7 @@ func initTables() error {
 		`CREATE TABLE IF NOT EXISTS users (
 		  id BIGINT PRIMARY KEY AUTO_INCREMENT,
 		  username VARCHAR(128) NOT NULL,
+		  bio TEXT DEFAULT NULL,
 		  password_salt VARCHAR(64) NOT NULL,
 		  password_hash VARCHAR(128) NOT NULL,
 		  created_at_unix BIGINT NOT NULL,
@@ -133,6 +134,20 @@ ADD COLUMN IF NOT EXISTS parent_folder_id BIGINT NULL
 `
 	if _, err := DB.Exec(ensureParentFolderColumn); err != nil {
 		if _, err2 := DB.Exec("ALTER TABLE files ADD COLUMN parent_folder_id BIGINT NULL"); err2 != nil {
+			if !strings.Contains(strings.ToLower(err2.Error()), "duplicate column") {
+				_ = DB.Close()
+				return err2
+			}
+		}
+	}
+
+	// 确保 users.bio 列存在
+	const ensureBioColumn = `
+ALTER TABLE users
+ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT NULL
+`
+	if _, err := DB.Exec(ensureBioColumn); err != nil {
+		if _, err2 := DB.Exec("ALTER TABLE users ADD COLUMN bio TEXT DEFAULT NULL"); err2 != nil {
 			if !strings.Contains(strings.ToLower(err2.Error()), "duplicate column") {
 				_ = DB.Close()
 				return err2
@@ -434,4 +449,99 @@ func RevokeSharesByNode(ownerID int64, nodeType string, nodeID string) error {
 		nodeID,
 	)
 	return err
+}
+
+// DeleteUserCascade 事务删除用户及其关联数据。
+func DeleteUserCascade(userID int64) error {
+	tx, err := DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("DELETE FROM shares WHERE owner_id = ?", userID); err != nil {
+		return err
+	}
+
+	rows, err := tx.Query("SELECT id, disk_path FROM files WHERE owner_id = ?", userID)
+	if err != nil {
+		return err
+	}
+	type fileInfo struct {
+		id   string
+		path string
+	}
+	files := make([]fileInfo, 0)
+	for rows.Next() {
+		var f fileInfo
+		if err := rows.Scan(&f.id, &f.path); err != nil {
+			rows.Close()
+			return err
+		}
+		files = append(files, f)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	if _, err := tx.Exec("DELETE FROM files WHERE owner_id = ?", userID); err != nil {
+		return err
+	}
+
+	if err := deleteAllFolders(tx, userID); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec("DELETE FROM auth_tokens WHERE user_id = ?", userID); err != nil {
+		return err
+	}
+
+	result, err := tx.Exec("DELETE FROM users WHERE id = ?", userID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return os.ErrNotExist
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	FilesMu.Lock()
+	for _, f := range files {
+		_ = os.Remove(f.path)
+		delete(FilesByID, f.id)
+	}
+	FilesMu.Unlock()
+
+	return nil
+}
+
+func deleteAllFolders(tx *sql.Tx, userID int64) error {
+	for {
+		result, err := tx.Exec(
+			`DELETE f FROM folders f
+			 LEFT JOIN folders sub ON sub.parent_id = f.id AND sub.owner_id = f.owner_id
+			 WHERE f.owner_id = ? AND sub.id IS NULL`,
+			userID,
+		)
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			break
+		}
+	}
+	return nil
 }

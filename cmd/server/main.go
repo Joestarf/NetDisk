@@ -35,6 +35,7 @@ func main() {
 	http.HandleFunc("/api/v1/auth/login", handlers.LoginHandler)
 	http.HandleFunc("/api/v1/auth/logout", middleware.AuthMiddleware(handlers.LogoutHandler))
 	http.HandleFunc("/api/v1/users/me", middleware.AuthMiddleware(handlers.UserMeHandler))
+	http.HandleFunc("/api/v1/users/me/password", middleware.AuthMiddleware(handlers.UpdatePasswordHandler))
 
 	// 文件接口
 	http.HandleFunc("/api/v1/files/upload", middleware.AuthMiddleware(handlers.UploadHandler))

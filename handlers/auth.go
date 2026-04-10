@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -176,15 +177,200 @@ func UserMeHandler(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		utils.WriteJSON(w, http.StatusOK, models.APIResponse{
-			Code:    0,
-			Message: "ok",
-			Data: map[string]interface{}{
-				"id":       user.ID,
-				"username": user.Username,
-			},
-		})
+		getUserInfoHandler(w, user)
+	case http.MethodPatch:
+		updateUserInfoHandler(w, r, user)
+	case http.MethodDelete:
+		DeleteAccountHandler(w, r)
 	default:
 		utils.WriteError(w, http.StatusMethodNotAllowed, 10001, "method not allowed")
 	}
+}
+
+func getUserInfoHandler(w http.ResponseWriter, user models.AuthUser) {
+	var username string
+	var bio sql.NullString
+	err := db.DB.QueryRow("SELECT username, bio FROM users WHERE id = ?", user.ID).Scan(&username, &bio)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			utils.WriteError(w, http.StatusUnauthorized, 10010, "unauthorized")
+			return
+		}
+		utils.WriteError(w, http.StatusInternalServerError, 10013, "failed to get user info")
+		return
+	}
+
+	resp := map[string]interface{}{
+		"id":       user.ID,
+		"username": username,
+	}
+	if bio.Valid && strings.TrimSpace(bio.String) != "" {
+		resp["bio"] = bio.String
+	}
+	utils.WriteJSON(w, http.StatusOK, models.APIResponse{Code: 0, Message: "ok", Data: resp})
+}
+
+func updateUserInfoHandler(w http.ResponseWriter, r *http.Request, user models.AuthUser) {
+	var req struct {
+		Bio *string `json:"bio,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.WriteError(w, http.StatusBadRequest, 10006, "invalid json body")
+		return
+	}
+
+	if req.Bio != nil {
+		if _, err := db.DB.Exec("UPDATE users SET bio = ? WHERE id = ?", *req.Bio, user.ID); err != nil {
+			utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to update bio")
+			return
+		}
+	}
+
+	var username string
+	var bio sql.NullString
+	err := db.DB.QueryRow("SELECT username, bio FROM users WHERE id = ?", user.ID).Scan(&username, &bio)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			utils.WriteError(w, http.StatusUnauthorized, 10010, "unauthorized")
+			return
+		}
+		utils.WriteError(w, http.StatusInternalServerError, 10013, "failed to get user info")
+		return
+	}
+
+	resp := map[string]interface{}{
+		"id":       user.ID,
+		"username": username,
+	}
+	if bio.Valid && strings.TrimSpace(bio.String) != "" {
+		resp["bio"] = bio.String
+	}
+	utils.WriteJSON(w, http.StatusOK, models.APIResponse{Code: 0, Message: "updated", Data: resp})
+}
+
+// UpdatePasswordHandler 修改当前用户密码
+func UpdatePasswordHandler(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.CurrentUser(r)
+	if !ok {
+		utils.WriteError(w, http.StatusUnauthorized, 10010, "unauthorized")
+		return
+	}
+
+	if r.Method != http.MethodPatch {
+		utils.WriteError(w, http.StatusMethodNotAllowed, 10001, "method not allowed")
+		return
+	}
+
+	var req struct {
+		OldPassword string `json:"old_password"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.WriteError(w, http.StatusBadRequest, 10006, "invalid json body")
+		return
+	}
+
+	req.OldPassword = strings.TrimSpace(req.OldPassword)
+	req.NewPassword = strings.TrimSpace(req.NewPassword)
+
+	if req.OldPassword == "" || req.NewPassword == "" {
+		utils.WriteError(w, http.StatusBadRequest, 10011, "invalid password")
+		return
+	}
+	if len(req.NewPassword) < 6 {
+		utils.WriteError(w, http.StatusBadRequest, 10011, "password too short")
+		return
+	}
+
+	var salt, hash string
+	err := db.DB.QueryRow(
+		"SELECT password_salt, password_hash FROM users WHERE id = ?",
+		user.ID,
+	).Scan(&salt, &hash)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10013, "failed to verify password")
+		return
+	}
+
+	if utils.HashPassword(req.OldPassword, salt) != hash {
+		utils.WriteError(w, http.StatusUnauthorized, 10010, "invalid old password")
+		return
+	}
+
+	newSalt, err := utils.GenerateID()
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to update password")
+		return
+	}
+	newHash := utils.HashPassword(req.NewPassword, newSalt)
+
+	_, err = db.DB.Exec(
+		"UPDATE users SET password_salt = ?, password_hash = ? WHERE id = ?",
+		newSalt,
+		newHash,
+		user.ID,
+	)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to update password")
+		return
+	}
+
+	utils.WriteJSON(w, http.StatusOK, models.APIResponse{Code: 0, Message: "password updated"})
+}
+
+// DeleteAccountHandler 删除当前用户账户（需密码确认）
+func DeleteAccountHandler(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.CurrentUser(r)
+	if !ok {
+		utils.WriteError(w, http.StatusUnauthorized, 10010, "unauthorized")
+		return
+	}
+
+	if r.Method != http.MethodDelete {
+		utils.WriteError(w, http.StatusMethodNotAllowed, 10001, "method not allowed")
+		return
+	}
+
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.WriteError(w, http.StatusBadRequest, 10006, "invalid json body")
+		return
+	}
+	req.Password = strings.TrimSpace(req.Password)
+	if req.Password == "" {
+		utils.WriteError(w, http.StatusBadRequest, 10011, "invalid password")
+		return
+	}
+
+	var salt, hash string
+	err := db.DB.QueryRow(
+		"SELECT password_salt, password_hash FROM users WHERE id = ?",
+		user.ID,
+	).Scan(&salt, &hash)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			utils.WriteError(w, http.StatusUnauthorized, 10010, "unauthorized")
+			return
+		}
+		utils.WriteError(w, http.StatusInternalServerError, 10013, "failed to verify password")
+		return
+	}
+
+	if utils.HashPassword(req.Password, salt) != hash {
+		utils.WriteError(w, http.StatusUnauthorized, 10010, "invalid password")
+		return
+	}
+
+	if err := db.DeleteUserCascade(user.ID); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			utils.WriteError(w, http.StatusUnauthorized, 10010, "unauthorized")
+			return
+		}
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to delete account")
+		return
+	}
+
+	utils.WriteJSON(w, http.StatusOK, models.APIResponse{Code: 0, Message: "account deleted"})
 }
