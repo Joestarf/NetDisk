@@ -3,15 +3,21 @@ package main
 import (
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"netdisk/config"
 	"netdisk/db"
 	"netdisk/handlers"
 	"netdisk/middleware"
+	"netdisk/nfsadapter"
 	"netdisk/storage"
+
+	nfs "github.com/willscott/go-nfs"
+	nfshelper "github.com/willscott/go-nfs/helpers"
 )
 
 func initStorage(cfg config.Config) error {
@@ -60,6 +66,7 @@ func main() {
 	if err := initStorage(cfg); err != nil {
 		log.Fatalf("failed to init storage backends: %v", err)
 	}
+	startNFSServerFromEnv()
 	// 认证接口
 	http.HandleFunc("/api/v1/auth/register", handlers.RegisterHandler)
 	http.HandleFunc("/api/v1/auth/login", handlers.LoginHandler)
@@ -90,4 +97,46 @@ func main() {
 	if err := http.ListenAndServe(":"+cfg.Port, nil); err != nil {
 		log.Fatalf("server failed: %v", err)
 	}
+}
+
+func startNFSServerFromEnv() {
+	enabled := strings.TrimSpace(os.Getenv("NFS_ENABLE"))
+	if enabled == "" {
+		enabled = "1"
+	}
+	if enabled == "0" || strings.EqualFold(enabled, "false") {
+		log.Println("NFS disabled by env NFS_ENABLE")
+		return
+	}
+
+	ownerID := int64(1)
+	if raw := strings.TrimSpace(os.Getenv("NFS_OWNER_ID")); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed <= 0 {
+			log.Printf("invalid NFS_OWNER_ID=%q, fallback to 1", raw)
+		} else {
+			ownerID = parsed
+		}
+	}
+
+	addr := strings.TrimSpace(os.Getenv("NFS_ADDR"))
+	if addr == "" {
+		addr = ":2049"
+	}
+
+	go func() {
+		listener, err := net.Listen("tcp", addr)
+		if err != nil {
+			log.Printf("NFS server failed to listen at %s: %v", addr, err)
+			return
+		}
+		log.Printf("NFS server running at %s (owner_id=%d)", addr, ownerID)
+
+		fs := nfsadapter.NewNetDiskFS(ownerID)
+		handler := nfshelper.NewNullAuthHandler(fs)
+		cacheHelper := nfshelper.NewCachingHandler(handler, 1024)
+		if err := nfs.Serve(listener, cacheHelper); err != nil {
+			log.Printf("NFS server error: %v", err)
+		}
+	}()
 }
