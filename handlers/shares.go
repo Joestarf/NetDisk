@@ -20,6 +20,7 @@ type shareView struct {
 	ID               int64     `json:"id"`
 	Token            string    `json:"token"`
 	ShareURL         string    `json:"share_url"`
+	ShareType        string    `json:"share_type"`
 	NodeType         string    `json:"node_type"`
 	NodeID           string    `json:"node_id"`
 	Name             string    `json:"name"`
@@ -135,6 +136,15 @@ func PublicShareHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if share.ShareType == "p2p_file" {
+		utils.WriteJSON(w, http.StatusOK, models.APIResponse{Code: 0, Message: "p2p share", Data: map[string]interface{}{
+			"share":       toShareView(*share),
+			"signal_base": "/api/v1/p2p/signals/" + share.Token,
+			"note":        "Use P2P client to exchange signaling info and transfer file directly between peers",
+		}})
+		return
+	}
+
 	switch share.NodeType {
 	case "file":
 		fileRec, err := GetFileRecordForOwner(share.NodeID, share.OwnerID)
@@ -177,6 +187,7 @@ func PublicShareHandler(w http.ResponseWriter, r *http.Request) {
 
 func createShareHandler(w http.ResponseWriter, r *http.Request, ownerID int64) {
 	type createShareRequest struct {
+		ShareType     string `json:"share_type"`
 		NodeType      string `json:"node_type"`
 		NodeID        string `json:"node_id"`
 		Password      string `json:"password"`
@@ -187,6 +198,14 @@ func createShareHandler(w http.ResponseWriter, r *http.Request, ownerID int64) {
 	var req createShareRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.WriteError(w, http.StatusBadRequest, 10006, "invalid json body")
+		return
+	}
+	req.ShareType = strings.TrimSpace(req.ShareType)
+	if req.ShareType == "" {
+		req.ShareType = "public_download"
+	}
+	if req.ShareType != "public_download" && req.ShareType != "p2p_file" {
+		utils.WriteError(w, http.StatusBadRequest, 10118, "invalid share_type")
 		return
 	}
 	req.NodeType = strings.TrimSpace(req.NodeType)
@@ -234,6 +253,7 @@ func createShareHandler(w http.ResponseWriter, r *http.Request, ownerID int64) {
 	share := &models.ShareRecord{
 		Token:         token,
 		OwnerID:       ownerID,
+		ShareType:     req.ShareType,
 		NodeType:      req.NodeType,
 		NodeID:        req.NodeID,
 		Name:          name,
@@ -259,6 +279,7 @@ func createShareHandler(w http.ResponseWriter, r *http.Request, ownerID int64) {
 			ID:            shareID,
 			Token:         token,
 			OwnerID:       ownerID,
+			ShareType:     req.ShareType,
 			NodeType:      req.NodeType,
 			NodeID:        req.NodeID,
 			Name:          name,
@@ -330,6 +351,7 @@ func toShareView(share models.ShareRecord) shareView {
 		ID:               share.ID,
 		Token:            share.Token,
 		ShareURL:         "/s/" + share.Token,
+		ShareType:        share.ShareType,
 		NodeType:         share.NodeType,
 		NodeID:           share.NodeID,
 		Name:             share.Name,

@@ -92,6 +92,7 @@ func main() {
 	http.HandleFunc("/api/v1/shares", middleware.AuthMiddleware(handlers.SharesCollectionHandler))
 	http.HandleFunc("/api/v1/shares/", middleware.AuthMiddleware(handlers.ShareItemHandler))
 	http.HandleFunc("/s/", handlers.PublicShareHandler)
+	http.HandleFunc("/api/v1/p2p/signals/", handlers.P2PSignalMuxHandler)
 
 	log.Printf("server is starting at :%s", cfg.Port)
 	if err := http.ListenAndServe(":"+cfg.Port, nil); err != nil {

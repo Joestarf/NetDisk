@@ -49,6 +49,7 @@ type ShareRecord struct {
 	ID            int64     `json:"id"`
 	Token         string    `json:"token"`
 	OwnerID       int64     `json:"owner_id"`
+	ShareType     string    `json:"share_type"`
 	NodeType      string    `json:"node_type"`
 	NodeID        string    `json:"node_id"`
 	Name          string    `json:"name"`

@@ -92,6 +92,7 @@ func initTables() error {
 		  id BIGINT PRIMARY KEY AUTO_INCREMENT,
 		  token VARCHAR(64) UNIQUE NOT NULL,
 		  owner_id BIGINT NOT NULL,
+		  share_type VARCHAR(32) NOT NULL DEFAULT 'public_download',
 		  node_type ENUM('file', 'folder') NOT NULL,
 		  node_id VARCHAR(128) NOT NULL,
 		  name VARCHAR(255) NOT NULL,
@@ -103,8 +104,17 @@ func initTables() error {
 		  created_at_unix BIGINT NOT NULL,
 		  updated_at_unix BIGINT NOT NULL,
 		  INDEX idx_shares_token (token),
+		  INDEX idx_shares_type (share_type),
 		  INDEX idx_shares_owner_id (owner_id),
 		  INDEX idx_shares_node (node_type, node_id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+		`CREATE TABLE IF NOT EXISTS p2p_signals (
+		  share_token VARCHAR(64) PRIMARY KEY,
+		  owner_id BIGINT NOT NULL,
+		  offer_json TEXT DEFAULT NULL,
+		  answer_json TEXT DEFAULT NULL,
+		  updated_at_unix BIGINT NOT NULL,
+		  INDEX idx_p2p_signals_owner (owner_id)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
 		`CREATE TABLE IF NOT EXISTS file_blobs (
 		  hash VARCHAR(64) PRIMARY KEY,
@@ -210,6 +220,35 @@ ADD COLUMN IF NOT EXISTS storage_backend VARCHAR(32) NOT NULL DEFAULT 'local'
 		}
 	}
 
+	// 确保 shares.share_type 列存在
+	const ensureShareTypeColumn = `
+ALTER TABLE shares
+ADD COLUMN IF NOT EXISTS share_type VARCHAR(32) NOT NULL DEFAULT 'public_download'
+`
+	if _, err := DB.Exec(ensureShareTypeColumn); err != nil {
+		if _, err2 := DB.Exec("ALTER TABLE shares ADD COLUMN share_type VARCHAR(32) NOT NULL DEFAULT 'public_download'"); err2 != nil {
+			if !strings.Contains(strings.ToLower(err2.Error()), "duplicate column") {
+				_ = DB.Close()
+				return err2
+			}
+		}
+	}
+
+	// 确保 shares.share_type 索引存在
+	const ensureShareTypeIndex = `
+ALTER TABLE shares
+ADD INDEX IF NOT EXISTS idx_shares_type (share_type)
+`
+	if _, err := DB.Exec(ensureShareTypeIndex); err != nil {
+		if _, err2 := DB.Exec("ALTER TABLE shares ADD INDEX idx_shares_type (share_type)"); err2 != nil {
+			errText := strings.ToLower(err2.Error())
+			if !strings.Contains(errText, "duplicate key") && !strings.Contains(errText, "already exists") {
+				_ = DB.Close()
+				return err2
+			}
+		}
+	}
+
 	// 确保 file_blobs.storage_key 列存在
 	const ensureBlobStorageKeyColumn = `
 ALTER TABLE file_blobs
@@ -308,14 +347,18 @@ func Close() error {
 
 // CreateShare 插入一条分享记录
 func CreateShare(share *models.ShareRecord) (int64, error) {
+	if strings.TrimSpace(share.ShareType) == "" {
+		share.ShareType = "public_download"
+	}
 	result, err := DB.Exec(
 		`INSERT INTO shares(
-			token, owner_id, node_type, node_id, name, password_hash,
+			token, owner_id, share_type, node_type, node_id, name, password_hash,
 			expires_at_unix, max_visits, visit_count, revoked,
 			created_at_unix, updated_at_unix
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		share.Token,
 		share.OwnerID,
+		share.ShareType,
 		share.NodeType,
 		share.NodeID,
 		share.Name,
@@ -336,7 +379,7 @@ func CreateShare(share *models.ShareRecord) (int64, error) {
 // ListSharesByOwner 查询用户创建的分享
 func ListSharesByOwner(ownerID int64) ([]models.ShareRecord, error) {
 	rows, err := DB.Query(
-		`SELECT id, token, owner_id, node_type, node_id, name, password_hash,
+		`SELECT id, token, owner_id, share_type, node_type, node_id, name, password_hash,
 			expires_at_unix, max_visits, visit_count, revoked,
 			created_at_unix, updated_at_unix
 		 FROM shares
@@ -360,6 +403,7 @@ func ListSharesByOwner(ownerID int64) ([]models.ShareRecord, error) {
 			&share.ID,
 			&share.Token,
 			&share.OwnerID,
+			&share.ShareType,
 			&share.NodeType,
 			&share.NodeID,
 			&share.Name,
@@ -405,7 +449,7 @@ func GetShareByToken(token string) (*models.ShareRecord, error) {
 	var maxVisits sql.NullInt64
 	var revoked int64
 	err := DB.QueryRow(
-		`SELECT id, token, owner_id, node_type, node_id, name, password_hash,
+		`SELECT id, token, owner_id, share_type, node_type, node_id, name, password_hash,
 			expires_at_unix, max_visits, visit_count, revoked,
 			created_at_unix, updated_at_unix
 		 FROM shares
@@ -415,6 +459,7 @@ func GetShareByToken(token string) (*models.ShareRecord, error) {
 		&share.ID,
 		&share.Token,
 		&share.OwnerID,
+		&share.ShareType,
 		&share.NodeType,
 		&share.NodeID,
 		&share.Name,
@@ -448,6 +493,77 @@ func GetShareByToken(token string) (*models.ShareRecord, error) {
 	share.CreatedAt = time.Unix(share.CreatedAtUnix, 0)
 	share.UpdatedAt = time.Unix(share.UpdatedAtUnix, 0)
 	return &share, nil
+}
+
+// UpsertP2POffer 保存/覆盖分享的 offer（由分享 owner 发布）。
+func UpsertP2POffer(ownerID int64, shareToken string, offerJSON string) error {
+	_, err := DB.Exec(
+		`INSERT INTO p2p_signals(share_token, owner_id, offer_json, answer_json, updated_at_unix)
+		 VALUES(?, ?, ?, NULL, ?)
+		 ON DUPLICATE KEY UPDATE
+		   owner_id = VALUES(owner_id),
+		   offer_json = VALUES(offer_json),
+		   answer_json = NULL,
+		   updated_at_unix = VALUES(updated_at_unix)`,
+		shareToken,
+		ownerID,
+		offerJSON,
+		time.Now().Unix(),
+	)
+	return err
+}
+
+// GetP2POffer 读取指定分享的 offer。
+func GetP2POffer(shareToken string) (string, error) {
+	var offer sql.NullString
+	err := DB.QueryRow("SELECT offer_json FROM p2p_signals WHERE share_token = ?", shareToken).Scan(&offer)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", os.ErrNotExist
+		}
+		return "", err
+	}
+	if !offer.Valid || strings.TrimSpace(offer.String) == "" {
+		return "", os.ErrNotExist
+	}
+	return offer.String, nil
+}
+
+// UpsertP2PAnswer 保存/覆盖分享的 answer（由接收方发布）。
+func UpsertP2PAnswer(shareToken string, answerJSON string) error {
+	_, err := DB.Exec(
+		`UPDATE p2p_signals
+		 SET answer_json = ?,
+		     updated_at_unix = ?
+		 WHERE share_token = ?`,
+		answerJSON,
+		time.Now().Unix(),
+		shareToken,
+	)
+	return err
+}
+
+// GetP2PAnswerForOwner 读取 owner 可见的 answer。
+func GetP2PAnswerForOwner(ownerID int64, shareToken string) (string, error) {
+	var answer sql.NullString
+	err := DB.QueryRow(
+		`SELECT s.answer_json
+		 FROM p2p_signals s
+		 JOIN shares sh ON sh.token = s.share_token
+		 WHERE s.share_token = ? AND sh.owner_id = ?`,
+		shareToken,
+		ownerID,
+	).Scan(&answer)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", os.ErrNotExist
+		}
+		return "", err
+	}
+	if !answer.Valid || strings.TrimSpace(answer.String) == "" {
+		return "", os.ErrNotExist
+	}
+	return answer.String, nil
 }
 
 // DeleteShareByID 删除用户自己的分享
