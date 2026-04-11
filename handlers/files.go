@@ -33,6 +33,11 @@ type chunkUploadMeta struct {
 	CreatedAtUnix  int64  `json:"created_at_unix"`
 }
 
+const (
+	errCodeChunkHashMismatch = 10033
+	errCodeMissingFileHash   = 10034
+)
+
 func chunkRootDir() string {
 	return filepath.Join(config.DefaultStorageDir, ".chunks")
 }
@@ -160,6 +165,11 @@ func ChunkUploadPartHandler(w http.ResponseWriter, r *http.Request) {
 		utils.WriteError(w, http.StatusBadRequest, 10006, "invalid chunk_index")
 		return
 	}
+	chunkHash := strings.TrimSpace(r.FormValue("chunk_hash"))
+	if chunkHash != "" && !isValidSHA256Hex(strings.ToLower(chunkHash)) {
+		utils.WriteError(w, http.StatusBadRequest, 10006, "invalid chunk_hash")
+		return
+	}
 	meta, err := readChunkMeta(uploadID)
 	if err != nil {
 		utils.WriteError(w, http.StatusNotFound, 10004, "upload session not found")
@@ -208,6 +218,29 @@ func ChunkUploadPartHandler(w http.ResponseWriter, r *http.Request) {
 		_ = os.Remove(tmpPath)
 		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to save chunk")
 		return
+	}
+
+	if chunkHash != "" {
+		part, err := os.Open(partPath)
+		if err != nil {
+			_ = os.Remove(partPath)
+			utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to verify chunk hash")
+			return
+		}
+		hasher := sha256.New()
+		if _, err := io.Copy(hasher, part); err != nil {
+			_ = part.Close()
+			_ = os.Remove(partPath)
+			utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to verify chunk hash")
+			return
+		}
+		_ = part.Close()
+		actualHash := hex.EncodeToString(hasher.Sum(nil))
+		if !strings.EqualFold(actualHash, chunkHash) {
+			_ = os.Remove(partPath)
+			utils.WriteError(w, http.StatusBadRequest, errCodeChunkHashMismatch, "chunk hash mismatch")
+			return
+		}
 	}
 
 	utils.WriteJSON(w, http.StatusOK, models.APIResponse{Code: 0, Message: "chunk uploaded", Data: map[string]interface{}{"chunk_index": chunkIndex}})
@@ -280,12 +313,22 @@ func ChunkUploadCompleteHandler(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		UploadID string `json:"upload_id"`
+		FileHash string `json:"file_hash"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.WriteError(w, http.StatusBadRequest, 10006, "invalid json body")
 		return
 	}
 	req.UploadID = strings.TrimSpace(req.UploadID)
+	req.FileHash = strings.TrimSpace(req.FileHash)
+	if req.FileHash == "" {
+		utils.WriteError(w, http.StatusBadRequest, errCodeMissingFileHash, "file_hash is required")
+		return
+	}
+	if !isValidSHA256Hex(strings.ToLower(req.FileHash)) {
+		utils.WriteError(w, http.StatusBadRequest, 10006, "invalid file_hash")
+		return
+	}
 
 	meta, err := readChunkMeta(req.UploadID)
 	if err != nil {
@@ -337,6 +380,24 @@ func ChunkUploadCompleteHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := merged.Close(); err != nil {
 		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to complete upload")
+		return
+	}
+
+	hf, err := os.Open(mergedPath)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to verify file hash")
+		return
+	}
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, hf); err != nil {
+		_ = hf.Close()
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to verify file hash")
+		return
+	}
+	_ = hf.Close()
+	actualHash := hex.EncodeToString(hasher.Sum(nil))
+	if !strings.EqualFold(actualHash, req.FileHash) {
+		utils.WriteError(w, http.StatusBadRequest, 10032, "file hash mismatch")
 		return
 	}
 
