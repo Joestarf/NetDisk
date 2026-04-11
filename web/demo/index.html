@@ -364,6 +364,7 @@
           <button class="btn" id="btnDebugCall">发起请求</button>
           <button class="btn alt" id="btnQuickFill">填充常用接口</button>
         </div>
+        <button class="btn blue" id="btnReplayFlow">一键回放主流程</button>
         <div class="quick">小贴士：若接口要求鉴权，会自动带上 token。</div>
         <div id="debugStatus" class="status"></div>
         <div id="debugOut" class="mono"></div>
@@ -423,7 +424,14 @@
         return res.blob();
       }
 
-      const body = await res.json().catch(() => ({}));
+      const contentType = (res.headers.get("content-type") || "").toLowerCase();
+      let body;
+      if (contentType.includes("application/json")) {
+        body = await res.json().catch(() => ({}));
+      } else {
+        const text = await res.text().catch(() => "");
+        body = { code: 0, message: "ok", data: text };
+      }
       if (!res.ok) {
         throw new Error((body && body.message) || ("HTTP " + res.status));
       }
@@ -786,9 +794,27 @@
         if (!tokenVal) throw new Error("请填写 public token");
         const pwd = $("publicPassword").value.trim();
         const suffix = pwd ? ("?password=" + encodeURIComponent(pwd)) : "";
-        const data = await api("/s/" + tokenVal + suffix, { publicRequest: true });
-        setStatus("shareStatus", "公开访问成功", true);
-        setOut("shareOut", data);
+        const res = await fetch(apiBase() + "/s/" + tokenVal + suffix);
+        if (!res.ok) {
+          const errJSON = await res.json().catch(() => null);
+          if (errJSON && errJSON.message) {
+            throw new Error(errJSON.message);
+          }
+          throw new Error("HTTP " + res.status);
+        }
+
+        const contentType = (res.headers.get("content-type") || "").toLowerCase();
+        if (contentType.includes("application/json")) {
+          const data = await res.json().catch(() => ({}));
+          setStatus("shareStatus", "公开访问成功（JSON）", true);
+          setOut("shareOut", data);
+        } else {
+          const blob = await res.blob();
+          const fileName = "shared-file-" + tokenVal;
+          downloadBlob(blob, fileName);
+          setStatus("shareStatus", "公开访问成功（文件已触发下载）", true);
+          setOut("shareOut", { token: tokenVal, content_type: contentType || "unknown", downloaded: true });
+        }
       } catch (err) {
         setStatus("shareStatus", "公开访问失败: " + err.message, false);
       }
@@ -1008,6 +1034,130 @@
       $("debugPath").value = next.p;
       $("debugBody").value = next.b;
       setStatus("debugStatus", "已切换到常用接口示例: " + next.p, true);
+    };
+
+    $("btnReplayFlow").onclick = async () => {
+      const btn = $("btnReplayFlow");
+      btn.disabled = true;
+      const logs = [];
+
+      function push(step, detail) {
+        logs.push({ step, detail, at: new Date().toLocaleTimeString() });
+        setOut("debugOut", logs);
+      }
+
+      try {
+        setStatus("debugStatus", "回放中: 健康检查 -> 登录 -> 上传 -> 列表 -> 创建分享", true);
+
+        const health = await api("/health", { publicRequest: true });
+        push("health", health);
+
+        const username = $("username").value.trim();
+        const password = $("password").value;
+        if (!username || !password) {
+          throw new Error("请先填写用户名和密码");
+        }
+
+        let login;
+        try {
+          login = await api("/api/v1/auth/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ username, password }),
+            publicRequest: true
+          });
+          push("login", login);
+        } catch (err) {
+          let reg;
+          try {
+            reg = await api("/api/v1/auth/register", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ username, password }),
+              publicRequest: true
+            });
+            push("register", reg);
+          } catch (regErr) {
+            push("register_skip", "注册失败，继续尝试登录: " + regErr.message);
+          }
+
+          login = await api("/api/v1/auth/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ username, password }),
+            publicRequest: true
+          });
+          push("login_after_register", login);
+        }
+
+        const tk = login && login.data && login.data.token;
+        if (!tk) {
+          throw new Error("登录成功但未拿到 token");
+        }
+        $("token").value = tk;
+
+        let activeFileID = $("fileId").value.trim();
+        const selectedFile = $("uploadFile").files[0];
+        if (selectedFile) {
+          const parent = $("uploadParentId").value.trim();
+          const fd = new FormData();
+          fd.append("file", selectedFile);
+          if (parent !== "") {
+            fd.append("parent_id", parent);
+          }
+          const upload = await api("/api/v1/files/upload", { method: "POST", body: fd });
+          push("upload", upload);
+          activeFileID = (upload.data && upload.data.id) || "";
+          if (activeFileID) {
+            $("fileId").value = activeFileID;
+            $("shareNodeId").value = activeFileID;
+            $("moveNodeType").value = "file";
+            $("moveNodeId").value = activeFileID;
+          }
+        } else {
+          push("upload", "跳过上传: 未选择文件，尝试复用 fileId 或列表中的现有文件");
+        }
+
+        const files = await api("/api/v1/files");
+        push("list_files", files);
+        const fileItems = Array.isArray(files.data) ? files.data : [];
+        if (!activeFileID && fileItems.length > 0) {
+          activeFileID = fileItems[0].id;
+          $("fileId").value = activeFileID;
+          $("shareNodeId").value = activeFileID;
+        }
+        if (!activeFileID) {
+          throw new Error("没有可用于创建分享的文件，请先在上传区选择文件");
+        }
+
+        const share = await api("/api/v1/shares", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            share_type: "public_download",
+            node_type: "file",
+            node_id: activeFileID
+          })
+        });
+        push("create_share", share);
+
+        const shareID = share && share.data && share.data.id;
+        const shareToken = share && share.data && share.data.token;
+        if (shareID) {
+          $("shareId").value = String(shareID);
+        }
+        if (shareToken) {
+          $("publicToken").value = shareToken;
+          $("p2pToken").value = shareToken;
+        }
+
+        setStatus("debugStatus", "回放完成: 主流程已成功执行", true);
+      } catch (err) {
+        push("error", err.message);
+        setStatus("debugStatus", "回放失败: " + err.message, false);
+      } finally {
+        btn.disabled = false;
+      }
     };
   </script>
 </body>
