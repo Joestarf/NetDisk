@@ -94,6 +94,12 @@ func main() {
 	http.HandleFunc("/s/", handlers.PublicShareHandler)
 	http.HandleFunc("/api/v1/p2p/signals/", handlers.P2PSignalMuxHandler)
 
+	// 简易演示前端
+	http.HandleFunc("/demo", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/demo/", http.StatusFound)
+	})
+	http.Handle("/demo/", http.StripPrefix("/demo/", http.FileServer(http.Dir("web/demo"))))
+
 	log.Printf("server is starting at :%s", cfg.Port)
 	if err := http.ListenAndServe(":"+cfg.Port, nil); err != nil {
 		log.Fatalf("server failed: %v", err)

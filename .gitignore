@@ -2,3 +2,14 @@ exercise/
 test/
 data/uploads/
 bin/
+
+# Local runtime artifacts
+cmd/p2pclient/p2pclient
+cmd/p2pclient/downloads/
+cmd/p2pclient/p2p_downloads/
+cmd/p2pclient/test.dat
+
+# Ad-hoc local test entrypoints
+/test*.go
+
+

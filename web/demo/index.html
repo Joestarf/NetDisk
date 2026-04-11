@@ -1,0 +1,1014 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NetDisk Feature Lab</title>
+  <style>
+    :root {
+      --bg: #f6f2e9;
+      --card: #fffcf7;
+      --ink: #1d2730;
+      --muted: #5a6672;
+      --line: #d6c8b7;
+      --primary: #0c7f71;
+      --secondary: #b65a1a;
+      --accent: #1f4f78;
+      --ok: #1f7a3a;
+      --err: #b3261e;
+      --shadow: 0 14px 28px rgba(40, 28, 14, 0.1);
+    }
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(900px 300px at 15% -10%, rgba(253, 201, 129, 0.5), rgba(253, 201, 129, 0)),
+        radial-gradient(780px 260px at 90% 0%, rgba(149, 220, 195, 0.45), rgba(149, 220, 195, 0)),
+        repeating-linear-gradient(135deg, rgba(36, 52, 66, 0.02), rgba(36, 52, 66, 0.02) 6px, rgba(36, 52, 66, 0.01) 6px, rgba(36, 52, 66, 0.01) 12px),
+        var(--bg);
+      padding: 20px;
+    }
+    .shell {
+      max-width: 1500px;
+      margin: 0 auto;
+      animation: riseIn 0.45s ease;
+    }
+    @keyframes riseIn {
+      from {
+        opacity: 0;
+        transform: translateY(10px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+    .hero {
+      border: 1px solid var(--line);
+      background: linear-gradient(110deg, #fff6e8, #f8fef8 58%, #eef6ff);
+      border-radius: 18px;
+      padding: 18px 20px;
+      margin-bottom: 14px;
+      box-shadow: var(--shadow);
+    }
+    .hero h1 {
+      margin: 0;
+      font-size: clamp(28px, 4.8vw, 38px);
+      letter-spacing: 0.4px;
+    }
+    .hero p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+      gap: 12px;
+    }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      background: var(--card);
+      padding: 14px;
+      box-shadow: var(--shadow);
+      animation: riseIn 0.35s ease;
+    }
+    .card h2 {
+      margin: 0 0 9px;
+      font-size: 18px;
+      color: #213243;
+    }
+    .tip {
+      font-size: 12px;
+      color: var(--muted);
+      margin: 0 0 8px;
+    }
+    label {
+      display: block;
+      margin: 7px 0 4px;
+      font-size: 12px;
+      color: #425061;
+    }
+    input,
+    textarea,
+    select,
+    button {
+      width: 100%;
+      border: 1px solid #c9beaf;
+      border-radius: 10px;
+      padding: 9px 10px;
+      font: inherit;
+      background: #fff;
+      color: var(--ink);
+    }
+    textarea {
+      min-height: 66px;
+      resize: vertical;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 7px;
+    }
+    .row3 {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 7px;
+    }
+    .btn {
+      border: 0;
+      color: #fff;
+      cursor: pointer;
+      margin-top: 7px;
+      background: var(--primary);
+      transition: transform 0.15s ease, filter 0.15s ease;
+    }
+    .btn:hover {
+      transform: translateY(-1px);
+      filter: brightness(1.04);
+    }
+    .btn.alt {
+      background: var(--secondary);
+    }
+    .btn.blue {
+      background: var(--accent);
+    }
+    .status {
+      margin-top: 8px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .status.ok {
+      color: var(--ok);
+    }
+    .status.err {
+      color: var(--err);
+    }
+    .mono {
+      margin-top: 8px;
+      border-radius: 11px;
+      border: 1px solid #313c4c;
+      background: #151c24;
+      color: #d9e4ef;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      padding: 10px;
+      max-height: 220px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .quick {
+      margin-top: 10px;
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-size: 12px;
+      background: #f6f9fc;
+      border: 1px dashed #b8c6d6;
+    }
+    @media (max-width: 640px) {
+      body {
+        padding: 12px;
+      }
+      .row,
+      .row3 {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <h1>NetDisk Feature Lab</h1>
+      <p>一页覆盖鉴权、文件、文件夹、分享、分片、P2P、对象迁移与接口调试。默认调用当前域名服务。</p>
+    </section>
+
+    <div class="layout">
+      <section class="card">
+        <h2>1) 鉴权与会话</h2>
+        <label>API Base</label>
+        <input id="apiBase" placeholder="http://127.0.0.1:8080" />
+        <label>用户名</label>
+        <input id="username" value="demo_user" />
+        <label>密码</label>
+        <input id="password" type="password" value="Passw0rd123!" />
+        <div class="row3">
+          <button class="btn" id="btnRegister">注册</button>
+          <button class="btn alt" id="btnLogin">登录</button>
+          <button class="btn blue" id="btnLogout">登出</button>
+        </div>
+        <button class="btn" id="btnMe">查询 /users/me</button>
+        <label>Bearer Token</label>
+        <textarea id="token"></textarea>
+        <div id="authStatus" class="status"></div>
+        <div id="authOut" class="mono"></div>
+      </section>
+
+      <section class="card">
+        <h2>2) 文件与对象迁移</h2>
+        <label>上传文件</label>
+        <input id="uploadFile" type="file" />
+        <label>父目录 ID（可选）</label>
+        <input id="uploadParentId" placeholder="留空表示根目录" />
+        <div class="row">
+          <button class="btn" id="btnUpload">上传</button>
+          <button class="btn alt" id="btnListFiles">刷新文件列表</button>
+        </div>
+        <label>当前文件 ID</label>
+        <input id="fileId" placeholder="上传后自动填充" />
+        <label>新文件名</label>
+        <input id="fileRename" placeholder="例如 renamed.txt" />
+        <div class="row3">
+          <button class="btn" id="btnFileDownload">下载</button>
+          <button class="btn alt" id="btnFileRename">重命名</button>
+          <button class="btn blue" id="btnFileDelete">删除</button>
+        </div>
+        <button class="btn" id="btnFileMigrate">迁移到对象存储</button>
+        <div id="fileStatus" class="status"></div>
+        <div id="fileOut" class="mono"></div>
+      </section>
+
+      <section class="card">
+        <h2>3) 文件夹与节点移动</h2>
+        <label>父目录 ID（根目录填 0）</label>
+        <input id="folderParentId" value="0" />
+        <label>新文件夹名</label>
+        <input id="folderName" value="demo-folder" />
+        <div class="row">
+          <button class="btn" id="btnFolderCreate">创建文件夹</button>
+          <button class="btn alt" id="btnFolderChildren">查询子节点</button>
+        </div>
+        <label>当前文件夹 ID</label>
+        <input id="folderId" placeholder="创建后自动填充" />
+        <label>新文件夹名（用于重命名）</label>
+        <input id="folderRename" placeholder="例如 folder-v2" />
+        <div class="row3">
+          <button class="btn" id="btnFolderDownload">下载目录 Zip</button>
+          <button class="btn alt" id="btnFolderRename">重命名</button>
+          <button class="btn blue" id="btnFolderDelete">删除</button>
+        </div>
+        <label>移动节点类型</label>
+        <select id="moveNodeType">
+          <option value="file">file</option>
+          <option value="folder">folder</option>
+        </select>
+        <label>节点 ID</label>
+        <input id="moveNodeId" placeholder="file_id 或 folder_id" />
+        <label>目标目录 ID（根目录填 0）</label>
+        <input id="moveTargetId" value="0" />
+        <button class="btn" id="btnMoveNode">移动节点</button>
+        <div id="folderStatus" class="status"></div>
+        <div id="folderOut" class="mono"></div>
+      </section>
+
+      <section class="card">
+        <h2>4) 分享管理</h2>
+        <label>Share Type</label>
+        <select id="shareType">
+          <option value="public_download">public_download</option>
+          <option value="p2p_file">p2p_file</option>
+        </select>
+        <label>Node Type</label>
+        <select id="shareNodeType">
+          <option value="file">file</option>
+          <option value="folder">folder</option>
+        </select>
+        <label>Node ID</label>
+        <input id="shareNodeId" placeholder="file_id 或 folder_id" />
+        <label>访问密码（可选）</label>
+        <input id="sharePassword" placeholder="留空为无密码" />
+        <label>过期秒数（可选）</label>
+        <input id="shareExpireIn" placeholder="例如 3600" />
+        <label>最大访问次数（可选）</label>
+        <input id="shareMaxVisits" placeholder="例如 5" />
+        <div class="row">
+          <button class="btn" id="btnShareCreate">创建分享</button>
+          <button class="btn alt" id="btnShareList">刷新我的分享</button>
+        </div>
+        <label>分享 ID（用于撤销/删除）</label>
+        <input id="shareId" />
+        <div class="row">
+          <button class="btn" id="btnShareRevoke">撤销分享</button>
+          <button class="btn blue" id="btnShareDelete">删除分享</button>
+        </div>
+        <label>公开访问 token</label>
+        <input id="publicToken" />
+        <label>公开访问密码（可选）</label>
+        <input id="publicPassword" />
+        <button class="btn" id="btnPublicOpen">访问 /s/{token}</button>
+        <div id="shareStatus" class="status"></div>
+        <div id="shareOut" class="mono"></div>
+      </section>
+
+      <section class="card">
+        <h2>5) 分片上传 + 秒传</h2>
+        <p class="tip">这里会自动对整文件和每个 chunk 算 SHA256，演示 upload/init/status/complete。</p>
+        <label>分片文件</label>
+        <input id="chunkFile" type="file" />
+        <label>chunk 大小 KB</label>
+        <input id="chunkSizeKb" value="256" />
+        <label>目标文件名</label>
+        <input id="chunkName" placeholder="默认使用原文件名" />
+        <label>父目录 ID（可选）</label>
+        <input id="chunkParentId" placeholder="留空表示根目录" />
+        <div class="row3">
+          <button class="btn" id="btnChunkRun">一键分片上传</button>
+          <button class="btn alt" id="btnChunkStatus">查询状态</button>
+          <button class="btn blue" id="btnInstantInit">触发秒传 init</button>
+        </div>
+        <label>upload_id</label>
+        <input id="chunkUploadId" />
+        <div id="chunkStatus" class="status"></div>
+        <div id="chunkOut" class="mono"></div>
+      </section>
+
+      <section class="card">
+        <h2>6) P2P 信令</h2>
+        <label>Share Token</label>
+        <input id="p2pToken" />
+        <label>Offer listen_addr</label>
+        <input id="listenAddr" placeholder="192.168.1.10:9099" />
+        <label>Answer receiver_addr</label>
+        <input id="receiverAddr" placeholder="192.168.1.20:0" />
+        <div class="row3">
+          <button class="btn" id="btnPubOffer">发布 Offer</button>
+          <button class="btn alt" id="btnGetOffer">查询 Offer</button>
+          <button class="btn blue" id="btnPubAnswer">发布 Answer</button>
+        </div>
+        <button class="btn" id="btnGetAnswer">查询 Answer</button>
+        <div id="p2pStatus" class="status"></div>
+        <div id="p2pOut" class="mono"></div>
+      </section>
+
+      <section class="card">
+        <h2>7) 通用 API 调试</h2>
+        <label>Method</label>
+        <select id="debugMethod">
+          <option>GET</option>
+          <option>POST</option>
+          <option>PATCH</option>
+          <option>DELETE</option>
+        </select>
+        <label>Path</label>
+        <input id="debugPath" value="/health" />
+        <label>JSON Body（可选）</label>
+        <textarea id="debugBody">{}</textarea>
+        <div class="row">
+          <button class="btn" id="btnDebugCall">发起请求</button>
+          <button class="btn alt" id="btnQuickFill">填充常用接口</button>
+        </div>
+        <div class="quick">小贴士：若接口要求鉴权，会自动带上 token。</div>
+        <div id="debugStatus" class="status"></div>
+        <div id="debugOut" class="mono"></div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    const state = {
+      files: [],
+      shares: [],
+      chunkHash: "",
+      chunkFileName: "",
+      chunkFileSize: 0
+    };
+
+    const apiBaseInput = $("apiBase");
+    apiBaseInput.value = location.origin;
+
+    function apiBase() {
+      return (apiBaseInput.value || location.origin).trim().replace(/\/$/, "");
+    }
+
+    function token() {
+      return $("token").value.trim();
+    }
+
+    function setStatus(id, text, ok) {
+      const el = $(id);
+      el.textContent = text;
+      el.className = "status " + (ok ? "ok" : "err");
+    }
+
+    function setOut(id, val) {
+      $(id).textContent = typeof val === "string" ? val : JSON.stringify(val, null, 2);
+    }
+
+    function parseIntSafe(v) {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    async function api(path, opts = {}) {
+      const headers = Object.assign({}, opts.headers || {});
+      if (!opts.publicRequest && token()) {
+        headers.Authorization = "Bearer " + token();
+      }
+      const res = await fetch(apiBase() + path, Object.assign({}, opts, { headers }));
+
+      if (opts.expectBinary) {
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          throw new Error(text || "HTTP " + res.status);
+        }
+        return res.blob();
+      }
+
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error((body && body.message) || ("HTTP " + res.status));
+      }
+      if (typeof body.code === "number" && body.code !== 0) {
+        throw new Error(body.message || ("业务错误 code=" + body.code));
+      }
+      return body;
+    }
+
+    function ensurePath(path) {
+      if (!path.startsWith("/")) {
+        return "/" + path;
+      }
+      return path;
+    }
+
+    async function sha256Hex(buf) {
+      const digest = await crypto.subtle.digest("SHA-256", buf);
+      return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    }
+
+    function downloadBlob(blob, fileName) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fileName || "download.bin";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    $("btnRegister").onclick = async () => {
+      try {
+        const payload = { username: $("username").value.trim(), password: $("password").value };
+        const data = await api("/api/v1/auth/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          publicRequest: true
+        });
+        setStatus("authStatus", "注册成功", true);
+        setOut("authOut", data);
+      } catch (err) {
+        setStatus("authStatus", "注册失败: " + err.message, false);
+      }
+    };
+
+    $("btnLogin").onclick = async () => {
+      try {
+        const payload = { username: $("username").value.trim(), password: $("password").value };
+        const data = await api("/api/v1/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          publicRequest: true
+        });
+        $("token").value = (data.data && data.data.token) || "";
+        setStatus("authStatus", "登录成功", true);
+        setOut("authOut", data);
+      } catch (err) {
+        setStatus("authStatus", "登录失败: " + err.message, false);
+      }
+    };
+
+    $("btnLogout").onclick = async () => {
+      try {
+        const data = await api("/api/v1/auth/logout", { method: "POST" });
+        setStatus("authStatus", "已登出", true);
+        setOut("authOut", data);
+      } catch (err) {
+        setStatus("authStatus", "登出失败: " + err.message, false);
+      }
+    };
+
+    $("btnMe").onclick = async () => {
+      try {
+        const data = await api("/api/v1/users/me");
+        setStatus("authStatus", "查询成功", true);
+        setOut("authOut", data);
+      } catch (err) {
+        setStatus("authStatus", "查询失败: " + err.message, false);
+      }
+    };
+
+    $("btnUpload").onclick = async () => {
+      try {
+        const f = $("uploadFile").files[0];
+        if (!f) throw new Error("请先选择文件");
+
+        const parent = $("uploadParentId").value.trim();
+        const fd = new FormData();
+        fd.append("file", f);
+        if (parent !== "") {
+          fd.append("parent_id", parent);
+        }
+        const data = await api("/api/v1/files/upload", { method: "POST", body: fd });
+        const id = data.data && data.data.id;
+        if (id) {
+          $("fileId").value = id;
+          $("shareNodeId").value = id;
+          $("moveNodeId").value = id;
+        }
+        setStatus("fileStatus", "上传成功", true);
+        setOut("fileOut", data);
+      } catch (err) {
+        setStatus("fileStatus", "上传失败: " + err.message, false);
+      }
+    };
+
+    $("btnListFiles").onclick = async () => {
+      try {
+        const data = await api("/api/v1/files");
+        state.files = (data.data && Array.isArray(data.data)) ? data.data : [];
+        if (state.files.length > 0 && !$("fileId").value) {
+          $("fileId").value = state.files[0].id;
+        }
+        setStatus("fileStatus", "已刷新文件列表（" + state.files.length + " 条）", true);
+        setOut("fileOut", data);
+      } catch (err) {
+        setStatus("fileStatus", "刷新失败: " + err.message, false);
+      }
+    };
+
+    $("btnFileRename").onclick = async () => {
+      try {
+        const id = $("fileId").value.trim();
+        const name = $("fileRename").value.trim();
+        if (!id || !name) throw new Error("请填写文件 ID 和新文件名");
+        const data = await api("/api/v1/files/" + id + "/rename", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name })
+        });
+        setStatus("fileStatus", "文件重命名成功", true);
+        setOut("fileOut", data);
+      } catch (err) {
+        setStatus("fileStatus", "文件重命名失败: " + err.message, false);
+      }
+    };
+
+    $("btnFileDelete").onclick = async () => {
+      try {
+        const id = $("fileId").value.trim();
+        if (!id) throw new Error("请填写文件 ID");
+        const data = await api("/api/v1/files/" + id, { method: "DELETE" });
+        setStatus("fileStatus", "文件已删除", true);
+        setOut("fileOut", data);
+      } catch (err) {
+        setStatus("fileStatus", "文件删除失败: " + err.message, false);
+      }
+    };
+
+    $("btnFileMigrate").onclick = async () => {
+      try {
+        const id = $("fileId").value.trim();
+        if (!id) throw new Error("请填写文件 ID");
+        const data = await api("/api/v1/files/" + id + "/migrate", { method: "POST" });
+        setStatus("fileStatus", "对象迁移完成", true);
+        setOut("fileOut", data);
+      } catch (err) {
+        setStatus("fileStatus", "对象迁移失败: " + err.message, false);
+      }
+    };
+
+    $("btnFileDownload").onclick = async () => {
+      try {
+        const id = $("fileId").value.trim();
+        if (!id) throw new Error("请填写文件 ID");
+        const blob = await api("/api/v1/files/" + id + "/download", { expectBinary: true });
+        downloadBlob(blob, "file-" + id);
+        setStatus("fileStatus", "下载触发成功", true);
+      } catch (err) {
+        setStatus("fileStatus", "下载失败: " + err.message, false);
+      }
+    };
+
+    $("btnFolderCreate").onclick = async () => {
+      try {
+        const parentRaw = $("folderParentId").value.trim();
+        const parentNum = parseIntSafe(parentRaw);
+        const parentId = parentNum === 0 ? null : parentNum;
+        const name = $("folderName").value.trim();
+        if (!name) throw new Error("请填写文件夹名称");
+
+        const payload = { name };
+        if (parentId !== null) payload.parent_id = parentId;
+        const data = await api("/api/v1/folders", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const id = data.data && data.data.id;
+        if (id) {
+          $("folderId").value = id;
+          $("shareNodeId").value = String(id);
+          $("moveNodeId").value = String(id);
+          $("moveNodeType").value = "folder";
+        }
+        setStatus("folderStatus", "文件夹创建成功", true);
+        setOut("folderOut", data);
+      } catch (err) {
+        setStatus("folderStatus", "文件夹创建失败: " + err.message, false);
+      }
+    };
+
+    $("btnFolderChildren").onclick = async () => {
+      try {
+        const idRaw = $("folderParentId").value.trim();
+        const id = idRaw === "" ? "0" : idRaw;
+        const data = await api("/api/v1/folders/" + id + "/children");
+        setStatus("folderStatus", "查询子节点成功", true);
+        setOut("folderOut", data);
+      } catch (err) {
+        setStatus("folderStatus", "查询子节点失败: " + err.message, false);
+      }
+    };
+
+    $("btnFolderRename").onclick = async () => {
+      try {
+        const id = $("folderId").value.trim();
+        const name = $("folderRename").value.trim();
+        if (!id || !name) throw new Error("请填写文件夹 ID 和新名称");
+        const data = await api("/api/v1/folders/" + id + "/rename", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name })
+        });
+        setStatus("folderStatus", "文件夹重命名成功", true);
+        setOut("folderOut", data);
+      } catch (err) {
+        setStatus("folderStatus", "文件夹重命名失败: " + err.message, false);
+      }
+    };
+
+    $("btnFolderDelete").onclick = async () => {
+      try {
+        const id = $("folderId").value.trim();
+        if (!id) throw new Error("请填写文件夹 ID");
+        const data = await api("/api/v1/folders/" + id, { method: "DELETE" });
+        setStatus("folderStatus", "文件夹已删除", true);
+        setOut("folderOut", data);
+      } catch (err) {
+        setStatus("folderStatus", "文件夹删除失败: " + err.message, false);
+      }
+    };
+
+    $("btnFolderDownload").onclick = async () => {
+      try {
+        const id = $("folderId").value.trim();
+        if (!id) throw new Error("请填写文件夹 ID");
+        const blob = await api("/api/v1/folders/" + id + "/download", { expectBinary: true });
+        downloadBlob(blob, "folder-" + id + ".zip");
+        setStatus("folderStatus", "目录下载成功", true);
+      } catch (err) {
+        setStatus("folderStatus", "目录下载失败: " + err.message, false);
+      }
+    };
+
+    $("btnMoveNode").onclick = async () => {
+      try {
+        const nodeType = $("moveNodeType").value;
+        const nodeId = $("moveNodeId").value.trim();
+        const targetRaw = $("moveTargetId").value.trim();
+        if (!nodeType || !nodeId) throw new Error("请填写 node_type 和 node_id");
+
+        const targetNum = parseIntSafe(targetRaw);
+        const target = targetNum === 0 ? null : targetNum;
+        const payload = { node_type: nodeType, node_id: nodeId };
+        if (target !== null) payload.target_folder_id = target;
+
+        const data = await api("/api/v1/nodes/move", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        setStatus("folderStatus", "移动成功", true);
+        setOut("folderOut", data);
+      } catch (err) {
+        setStatus("folderStatus", "移动失败: " + err.message, false);
+      }
+    };
+
+    $("btnShareCreate").onclick = async () => {
+      try {
+        const shareType = $("shareType").value;
+        const nodeType = $("shareNodeType").value;
+        const nodeId = $("shareNodeId").value.trim();
+        if (!nodeId) throw new Error("请填写 Node ID");
+
+        const payload = {
+          share_type: shareType,
+          node_type: nodeType,
+          node_id: nodeId
+        };
+
+        const pwd = $("sharePassword").value.trim();
+        const expireIn = parseIntSafe($("shareExpireIn").value.trim());
+        const maxVisits = parseIntSafe($("shareMaxVisits").value.trim());
+        if (pwd) payload.password = pwd;
+        if (expireIn !== null && expireIn > 0) payload.expires_at_unix = Math.floor(Date.now() / 1000) + expireIn;
+        if (maxVisits !== null && maxVisits > 0) payload.max_visits = maxVisits;
+
+        const data = await api("/api/v1/shares", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const d = data.data || {};
+        if (d.id) $("shareId").value = String(d.id);
+        if (d.token) {
+          $("publicToken").value = d.token;
+          $("p2pToken").value = d.token;
+        }
+        setStatus("shareStatus", "分享创建成功", true);
+        setOut("shareOut", data);
+      } catch (err) {
+        setStatus("shareStatus", "分享创建失败: " + err.message, false);
+      }
+    };
+
+    $("btnShareList").onclick = async () => {
+      try {
+        const data = await api("/api/v1/shares");
+        state.shares = (data.data && Array.isArray(data.data)) ? data.data : [];
+        setStatus("shareStatus", "分享列表刷新成功（" + state.shares.length + " 条）", true);
+        setOut("shareOut", data);
+      } catch (err) {
+        setStatus("shareStatus", "分享列表刷新失败: " + err.message, false);
+      }
+    };
+
+    $("btnShareRevoke").onclick = async () => {
+      try {
+        const id = $("shareId").value.trim();
+        if (!id) throw new Error("请填写 share_id");
+        const data = await api("/api/v1/shares/" + id, { method: "PATCH" });
+        setStatus("shareStatus", "分享已撤销", true);
+        setOut("shareOut", data);
+      } catch (err) {
+        setStatus("shareStatus", "撤销失败: " + err.message, false);
+      }
+    };
+
+    $("btnShareDelete").onclick = async () => {
+      try {
+        const id = $("shareId").value.trim();
+        if (!id) throw new Error("请填写 share_id");
+        const data = await api("/api/v1/shares/" + id, { method: "DELETE" });
+        setStatus("shareStatus", "分享已删除", true);
+        setOut("shareOut", data);
+      } catch (err) {
+        setStatus("shareStatus", "删除失败: " + err.message, false);
+      }
+    };
+
+    $("btnPublicOpen").onclick = async () => {
+      try {
+        const tokenVal = $("publicToken").value.trim();
+        if (!tokenVal) throw new Error("请填写 public token");
+        const pwd = $("publicPassword").value.trim();
+        const suffix = pwd ? ("?password=" + encodeURIComponent(pwd)) : "";
+        const data = await api("/s/" + tokenVal + suffix, { publicRequest: true });
+        setStatus("shareStatus", "公开访问成功", true);
+        setOut("shareOut", data);
+      } catch (err) {
+        setStatus("shareStatus", "公开访问失败: " + err.message, false);
+      }
+    };
+
+    $("btnChunkRun").onclick = async () => {
+      try {
+        const file = $("chunkFile").files[0];
+        if (!file) throw new Error("请先选择分片文件");
+
+        const sizeKb = Number($("chunkSizeKb").value.trim() || "256");
+        if (!Number.isFinite(sizeKb) || sizeKb <= 0) throw new Error("chunk 大小必须是正数");
+        const chunkSize = Math.max(1, Math.floor(sizeKb * 1024));
+
+        const fileBuf = await file.arrayBuffer();
+        const fileHash = await sha256Hex(fileBuf);
+        state.chunkHash = fileHash;
+        state.chunkFileName = file.name;
+        state.chunkFileSize = file.size;
+
+        const totalChunks = Math.ceil(file.size / chunkSize);
+        const parentRaw = $("chunkParentId").value.trim();
+        const parentNum = parseIntSafe(parentRaw);
+        const payload = {
+          name: $("chunkName").value.trim() || file.name,
+          total_chunks: totalChunks,
+          total_size_bytes: file.size,
+          file_hash: fileHash
+        };
+        if (parentRaw !== "" && parentNum !== null && parentNum !== 0) {
+          payload.parent_id = parentNum;
+        }
+
+        const init = await api("/api/v1/files/upload/init", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+
+        if (init.message === "instant uploaded") {
+          setStatus("chunkStatus", "秒传命中，未走分片", true);
+          setOut("chunkOut", init);
+          return;
+        }
+
+        const uploadId = init.data && init.data.upload_id;
+        if (!uploadId) throw new Error("init 返回缺少 upload_id");
+        $("chunkUploadId").value = uploadId;
+
+        for (let i = 0; i < totalChunks; i++) {
+          const start = i * chunkSize;
+          const end = Math.min(file.size, start + chunkSize);
+          const chunk = file.slice(start, end);
+          const chunkHash = await sha256Hex(await chunk.arrayBuffer());
+          const form = new FormData();
+          form.append("upload_id", uploadId);
+          form.append("chunk_index", String(i));
+          form.append("chunk_hash", chunkHash);
+          form.append("chunk", chunk, file.name + ".part" + i);
+          await api("/api/v1/files/upload/chunk", { method: "POST", body: form });
+          setStatus("chunkStatus", "上传分片 " + (i + 1) + "/" + totalChunks, true);
+        }
+
+        const complete = await api("/api/v1/files/upload/complete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ upload_id: uploadId, file_hash: fileHash })
+        });
+
+        const fileId = complete.data && complete.data.id;
+        if (fileId) {
+          $("fileId").value = fileId;
+          $("shareNodeId").value = fileId;
+          $("moveNodeType").value = "file";
+          $("moveNodeId").value = fileId;
+        }
+
+        setStatus("chunkStatus", "分片上传完成", true);
+        setOut("chunkOut", { init, complete, file_hash: fileHash, total_chunks: totalChunks });
+      } catch (err) {
+        setStatus("chunkStatus", "分片上传失败: " + err.message, false);
+      }
+    };
+
+    $("btnChunkStatus").onclick = async () => {
+      try {
+        const uploadId = $("chunkUploadId").value.trim();
+        if (!uploadId) throw new Error("请填写 upload_id");
+        const data = await api("/api/v1/files/upload/status?upload_id=" + encodeURIComponent(uploadId));
+        setStatus("chunkStatus", "状态查询成功", true);
+        setOut("chunkOut", data);
+      } catch (err) {
+        setStatus("chunkStatus", "状态查询失败: " + err.message, false);
+      }
+    };
+
+    $("btnInstantInit").onclick = async () => {
+      try {
+        const file = $("chunkFile").files[0];
+        if (!file) throw new Error("请先选择文件");
+        const fileHash = state.chunkHash || await sha256Hex(await file.arrayBuffer());
+
+        const data = await api("/api/v1/files/upload/init", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: "instant-" + file.name,
+            total_chunks: 1,
+            total_size_bytes: file.size,
+            file_hash: fileHash
+          })
+        });
+        setStatus("chunkStatus", "秒传 init 请求成功", true);
+        setOut("chunkOut", data);
+      } catch (err) {
+        setStatus("chunkStatus", "秒传 init 失败: " + err.message, false);
+      }
+    };
+
+    $("btnPubOffer").onclick = async () => {
+      try {
+        const shareToken = $("p2pToken").value.trim();
+        if (!shareToken) throw new Error("请填写 p2p share token");
+        const body = {
+          listen_addr: $("listenAddr").value.trim(),
+          file_name: "demo.bin",
+          file_size_bytes: 0
+        };
+        const data = await api("/api/v1/p2p/signals/" + shareToken + "/offer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        setStatus("p2pStatus", "Offer 发布成功", true);
+        setOut("p2pOut", data);
+      } catch (err) {
+        setStatus("p2pStatus", "Offer 发布失败: " + err.message, false);
+      }
+    };
+
+    $("btnGetOffer").onclick = async () => {
+      try {
+        const shareToken = $("p2pToken").value.trim();
+        if (!shareToken) throw new Error("请填写 p2p share token");
+        const pwd = $("publicPassword").value.trim();
+        const suffix = pwd ? ("?password=" + encodeURIComponent(pwd)) : "";
+        const data = await api("/api/v1/p2p/signals/" + shareToken + "/offer" + suffix, { publicRequest: true });
+        setStatus("p2pStatus", "Offer 查询成功", true);
+        setOut("p2pOut", data);
+      } catch (err) {
+        setStatus("p2pStatus", "Offer 查询失败: " + err.message, false);
+      }
+    };
+
+    $("btnPubAnswer").onclick = async () => {
+      try {
+        const shareToken = $("p2pToken").value.trim();
+        if (!shareToken) throw new Error("请填写 p2p share token");
+        const pwd = $("publicPassword").value.trim();
+        const suffix = pwd ? ("?password=" + encodeURIComponent(pwd)) : "";
+        const data = await api("/api/v1/p2p/signals/" + shareToken + "/answer" + suffix, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ receiver_addr: $("receiverAddr").value.trim() || "peer:0" }),
+          publicRequest: true
+        });
+        setStatus("p2pStatus", "Answer 发布成功", true);
+        setOut("p2pOut", data);
+      } catch (err) {
+        setStatus("p2pStatus", "Answer 发布失败: " + err.message, false);
+      }
+    };
+
+    $("btnGetAnswer").onclick = async () => {
+      try {
+        const shareToken = $("p2pToken").value.trim();
+        if (!shareToken) throw new Error("请填写 p2p share token");
+        const data = await api("/api/v1/p2p/signals/" + shareToken + "/answer");
+        setStatus("p2pStatus", "Answer 查询成功", true);
+        setOut("p2pOut", data);
+      } catch (err) {
+        setStatus("p2pStatus", "Answer 查询失败: " + err.message, false);
+      }
+    };
+
+    $("btnDebugCall").onclick = async () => {
+      try {
+        const method = $("debugMethod").value;
+        const path = ensurePath($("debugPath").value.trim() || "/health");
+        const rawBody = $("debugBody").value.trim();
+
+        const opts = { method };
+        if (method !== "GET" && method !== "DELETE") {
+          opts.headers = { "Content-Type": "application/json" };
+          opts.body = rawBody ? JSON.stringify(JSON.parse(rawBody)) : "{}";
+        }
+
+        const data = await api(path, opts);
+        setStatus("debugStatus", "调用成功", true);
+        setOut("debugOut", data);
+      } catch (err) {
+        setStatus("debugStatus", "调用失败: " + err.message, false);
+      }
+    };
+
+    $("btnQuickFill").onclick = () => {
+      const samples = [
+        { m: "GET", p: "/health", b: "{}" },
+        { m: "GET", p: "/api/v1/files", b: "{}" },
+        { m: "GET", p: "/api/v1/shares", b: "{}" },
+        { m: "POST", p: "/api/v1/nodes/move", b: "{\n  \"node_type\": \"file\",\n  \"node_id\": \"replace_me\",\n  \"target_folder_id\": 1\n}" }
+      ];
+      const current = $("debugPath").value.trim();
+      const idx = samples.findIndex((x) => x.p === current);
+      const next = samples[(idx + 1 + samples.length) % samples.length];
+      $("debugMethod").value = next.m;
+      $("debugPath").value = next.p;
+      $("debugBody").value = next.b;
+      setStatus("debugStatus", "已切换到常用接口示例: " + next.p, true);
+    };
+  </script>
+</body>
+</html>
