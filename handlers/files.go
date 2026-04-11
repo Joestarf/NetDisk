@@ -671,8 +671,8 @@ func FileItemHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
-	case action == "download" && r.Method == http.MethodGet:
-		downloadHandler(w, r, id, user.ID)
+	case action == "download" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
+    downloadHandler(w, r, id, user.ID)
 	case action == "rename" && r.Method == http.MethodPatch:
 		renameHandler(w, r, id, user.ID)
 	case action == "" && r.Method == http.MethodDelete:
