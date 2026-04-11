@@ -9,18 +9,20 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 API_PORT="${API_PORT:-8080}"
 API_BASE="${API_BASE:-http://127.0.0.1:${API_PORT}}"
 NFS_ADDR="${NFS_ADDR:-:2049}"
-NFS_OWNER_ID="${NFS_OWNER_ID:-1}"
+NFS_EXPORT_PREFIX="${NFS_EXPORT_PREFIX:-/users}"
+NFS_REQUIRE_MOUNT_AUTH="${NFS_REQUIRE_MOUNT_AUTH:-1}"
+NFS_MOUNT_AUTH_MODE="${NFS_MOUNT_AUTH_MODE:-token}"
 MOUNT_DIR="${MOUNT_DIR:-/tmp/netdisk-nfs-e2e}"
 TEST_USERNAME="${TEST_USERNAME:-}"
 TEST_PASSWORD="${TEST_PASSWORD:-}"
 AUTO_KILL_PORTS="${AUTO_KILL_PORTS:-0}"
 
 : "${MYSQL_DSN:?MYSQL_DSN is required}"
-: "${TEST_USERNAME:?TEST_USERNAME is required (must match NFS_OWNER_ID user)}"
+: "${TEST_USERNAME:?TEST_USERNAME is required}"
 : "${TEST_PASSWORD:?TEST_PASSWORD is required (must match TEST_USERNAME)}"
 
 echo "[INFO] root=${ROOT_DIR}"
-echo "[INFO] api=${API_BASE} nfs_addr=${NFS_ADDR} owner_id=${NFS_OWNER_ID}"
+echo "[INFO] api=${API_BASE} nfs_addr=${NFS_ADDR} export_prefix=${NFS_EXPORT_PREFIX} require_mount_auth=${NFS_REQUIRE_MOUNT_AUTH} auth_mode=${NFS_MOUNT_AUTH_MODE}"
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -35,66 +37,6 @@ require_cmd go
 require_cmd mount
 require_cmd umount
 require_cmd ss
-
-resolve_owner_id() {
-  if [[ "${NFS_OWNER_ID}" =~ ^[0-9]+$ ]]; then
-    return 0
-  fi
-
-  local lookup_username="${NFS_OWNER_ID}"
-  if [[ -z "${lookup_username}" || "${lookup_username}" == "auto" ]]; then
-    lookup_username="${TEST_USERNAME}"
-  fi
-
-  echo "[INFO] resolving NFS owner id by username=${lookup_username}"
-  local tmp_go_file="/tmp/netdisk_owner_id_lookup_$$.go"
-  cat >"${tmp_go_file}" <<'EOF'
-package main
-
-import (
-  "database/sql"
-  "fmt"
-  "log"
-  "os"
-
-  _ "github.com/go-sql-driver/mysql"
-)
-
-func main() {
-  dsn := os.Getenv("MYSQL_DSN")
-  username := os.Getenv("LOOKUP_USERNAME")
-  db, err := sql.Open("mysql", dsn)
-  if err != nil {
-    log.Fatal(err)
-  }
-  defer db.Close()
-
-  var id int64
-  if err := db.QueryRow("SELECT id FROM users WHERE username = ? LIMIT 1", username).Scan(&id); err != nil {
-    log.Fatal(err)
-  }
-  fmt.Print(id)
-}
-EOF
-
-  local resolved
-  if ! resolved="$(MYSQL_DSN="${MYSQL_DSN}" LOOKUP_USERNAME="${lookup_username}" go run "${tmp_go_file}" 2>/dev/null)"; then
-    rm -f "${tmp_go_file}"
-    echo "[ERROR] cannot resolve numeric owner id by username=${lookup_username}" >&2
-    echo "[HINT] set NFS_OWNER_ID to a numeric id, or make sure the user exists in DB first." >&2
-    exit 1
-  fi
-  rm -f "${tmp_go_file}"
-
-  if ! [[ "${resolved}" =~ ^[0-9]+$ ]]; then
-    echo "[ERROR] resolved owner id is invalid: ${resolved}" >&2
-    exit 1
-  fi
-  NFS_OWNER_ID="${resolved}"
-  echo "[INFO] resolved owner_id=${NFS_OWNER_ID}"
-}
-
-resolve_owner_id
 
 SERVER_PID=""
 cleanup() {
@@ -203,7 +145,7 @@ ensure_port_free "${nfs_port}" "NFS"
 
 (
   cd "${ROOT_DIR}" || exit 1
-  PORT="${API_PORT}" NFS_ENABLE=1 NFS_ADDR="${NFS_ADDR}" NFS_OWNER_ID="${NFS_OWNER_ID}" MYSQL_DSN="${MYSQL_DSN}" \
+  PORT="${API_PORT}" NFS_ENABLE=1 NFS_ADDR="${NFS_ADDR}" NFS_REQUIRE_MOUNT_AUTH="${NFS_REQUIRE_MOUNT_AUTH}" NFS_MOUNT_AUTH_MODE="${NFS_MOUNT_AUTH_MODE}" MYSQL_DSN="${MYSQL_DSN}" \
     go run ./cmd/server >/tmp/netdisk-nfs-e2e-server.log 2>&1
 ) &
 SERVER_PID=$!
@@ -260,23 +202,25 @@ if [[ -z "${token}" ]]; then
   exit 1
 fi
 
-echo "[STEP] verify logged-in user id matches NFS owner id"
-me_resp="$(api_get_auth "${API_BASE}/api/v1/users/me" "${token}")"
-me_code="$(json_get code "${me_resp}")"
-if [[ "${me_code}" != "0" ]]; then
-  echo "[ERROR] users/me failed: ${me_resp}" >&2
-  exit 1
-fi
-me_id="$(json_get data.id "${me_resp}")"
-if [[ "${me_id}" != "${NFS_OWNER_ID}" ]]; then
-  echo "[ERROR] logged-in user id (${me_id}) != NFS_OWNER_ID (${NFS_OWNER_ID})."
-  echo "[HINT] set NFS_OWNER_ID to this user id or use credentials for that owner." >&2
-  exit 1
-fi
-
 echo "[STEP] mount NFS"
 mkdir -p "${MOUNT_DIR}"
-mount_opts="-o port=${nfs_port},mountport=${nfs_port},nfsvers=3,noacl,tcp -t nfs localhost:/ ${MOUNT_DIR}"
+mount_target="${NFS_EXPORT_PREFIX%/}/${TEST_USERNAME}"
+if [[ "${NFS_REQUIRE_MOUNT_AUTH}" == "1" || "${NFS_REQUIRE_MOUNT_AUTH}" == "true" || "${NFS_REQUIRE_MOUNT_AUTH}" == "TRUE" ]]; then
+  case "${NFS_MOUNT_AUTH_MODE}" in
+    token|TOKEN|Token|either|EITHER|Either)
+      mount_target="${mount_target}/token/${token}"
+      ;;
+    password|PASSWORD|Password)
+      # 注意：密码包含 '/' 时无法直接放入路径，推荐使用 token 模式。
+      mount_target="${mount_target}/password/${TEST_PASSWORD}"
+      ;;
+    *)
+      echo "[ERROR] unsupported NFS_MOUNT_AUTH_MODE=${NFS_MOUNT_AUTH_MODE}, expect token/password/either" >&2
+      exit 1
+      ;;
+  esac
+fi
+mount_opts="-o port=${nfs_port},mountport=${nfs_port},nfsvers=3,noacl,tcp -t nfs localhost:${mount_target} ${MOUNT_DIR}"
 
 # 先尝试当前用户直接挂载（容器或已授权环境可能可行）
 if timeout 15s mount ${mount_opts} >/dev/null 2>&1; then
@@ -292,6 +236,7 @@ else
     exit 1
   fi
 fi
+echo "[OK] mounted target=${mount_target}"
 
 # 1) create dirs
 echo "[CASE] mkdir"

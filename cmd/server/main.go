@@ -109,13 +109,21 @@ func startNFSServerFromEnv() {
 		return
 	}
 
-	ownerID := int64(1)
-	if raw := strings.TrimSpace(os.Getenv("NFS_OWNER_ID")); raw != "" {
+	defaultOwnerID := int64(0)
+	if raw := strings.TrimSpace(os.Getenv("NFS_DEFAULT_OWNER_ID")); raw != "" {
 		parsed, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil || parsed <= 0 {
-			log.Printf("invalid NFS_OWNER_ID=%q, fallback to 1", raw)
+			log.Printf("invalid NFS_DEFAULT_OWNER_ID=%q, ignore root fallback", raw)
 		} else {
-			ownerID = parsed
+			defaultOwnerID = parsed
+		}
+	} else if raw := strings.TrimSpace(os.Getenv("NFS_OWNER_ID")); raw != "" {
+		// 向后兼容旧变量名。
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed <= 0 {
+			log.Printf("invalid NFS_OWNER_ID=%q, ignore root fallback", raw)
+		} else {
+			defaultOwnerID = parsed
 		}
 	}
 
@@ -124,16 +132,25 @@ func startNFSServerFromEnv() {
 		addr = ":2049"
 	}
 
+	requireMountAuth := false
+	if raw := strings.TrimSpace(os.Getenv("NFS_REQUIRE_MOUNT_AUTH")); raw != "" {
+		requireMountAuth = raw == "1" || strings.EqualFold(raw, "true")
+	}
+
+	mountAuthMode := strings.TrimSpace(os.Getenv("NFS_MOUNT_AUTH_MODE"))
+	if mountAuthMode == "" {
+		mountAuthMode = "token"
+	}
+
 	go func() {
 		listener, err := net.Listen("tcp", addr)
 		if err != nil {
 			log.Printf("NFS server failed to listen at %s: %v", addr, err)
 			return
 		}
-		log.Printf("NFS server running at %s (owner_id=%d)", addr, ownerID)
+		log.Printf("NFS server running at %s (default_owner_id=%d, mount_auth=%v, auth_mode=%s, mount /users/{username}[/token/{t}|/password/{p}])", addr, defaultOwnerID, requireMountAuth, mountAuthMode)
 
-		fs := nfsadapter.NewNetDiskFS(ownerID)
-		handler := nfshelper.NewNullAuthHandler(fs)
+		handler := nfsadapter.NewMultiUserHandler(defaultOwnerID, requireMountAuth, mountAuthMode)
 		cacheHelper := nfshelper.NewCachingHandler(handler, 1024)
 		if err := nfs.Serve(listener, cacheHelper); err != nil {
 			log.Printf("NFS server error: %v", err)
