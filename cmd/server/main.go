@@ -1,16 +1,44 @@
 package main
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"netdisk/config"
 	"netdisk/db"
 	"netdisk/handlers"
 	"netdisk/middleware"
+	"netdisk/storage"
 )
 
+func initStorage(cfg config.Config) error {
+	hasAnyOSSConfig := cfg.OSSEndpoint != "" || cfg.OSSAccessKeyID != "" || cfg.OSSAccessKeySecret != "" || cfg.OSSBucket != ""
+	if !hasAnyOSSConfig {
+		log.Println("OSS not configured, migration/download-url will use local storage")
+		return nil
+	}
+
+	if cfg.OSSEndpoint == "" || cfg.OSSAccessKeyID == "" || cfg.OSSAccessKeySecret == "" || cfg.OSSBucket == "" {
+		return errors.New("incomplete OSS config: OSS_ENDPOINT/OSS_ACCESS_KEY_ID/OSS_ACCESS_KEY_SECRET/OSS_BUCKET are required")
+	}
+
+	ossBackend, err := storage.NewOSSBackend(
+		strings.TrimSpace(cfg.OSSEndpoint),
+		strings.TrimSpace(cfg.OSSAccessKeyID),
+		strings.TrimSpace(cfg.OSSAccessKeySecret),
+		strings.TrimSpace(cfg.OSSBucket),
+	)
+	if err != nil {
+		return err
+	}
+
+	storage.SetObjectBackend(ossBackend)
+	log.Println("OSS backend initialized successfully")
+	return nil
+}
 func main() {
 	cfg := config.Load()
 
@@ -29,7 +57,9 @@ func main() {
 
 	// 健康检查
 	http.HandleFunc("/health", handlers.HealthHandler)
-
+	if err := initStorage(cfg); err != nil {
+		log.Fatalf("failed to init storage backends: %v", err)
+	}
 	// 认证接口
 	http.HandleFunc("/api/v1/auth/register", handlers.RegisterHandler)
 	http.HandleFunc("/api/v1/auth/login", handlers.LoginHandler)

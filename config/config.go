@@ -10,6 +10,10 @@ type Config struct {
 	Port       string
 	MySQLDSN   string
 	StorageDir string
+	OSSEndpoint        string
+    OSSAccessKeyID     string
+    OSSAccessKeySecret string
+    OSSBucket          string
 }
 
 const DefaultStorageDir = "data/uploads"
@@ -29,5 +33,9 @@ func Load() Config {
 		Port:       port,
 		MySQLDSN:   mysqlDSN,
 		StorageDir: storageDir,
+		OSSEndpoint:        strings.TrimSpace(os.Getenv("OSS_ENDPOINT")),
+        OSSAccessKeyID:     strings.TrimSpace(os.Getenv("OSS_ACCESS_KEY_ID")),
+        OSSAccessKeySecret: strings.TrimSpace(os.Getenv("OSS_ACCESS_KEY_SECRET")),
+        OSSBucket:          strings.TrimSpace(os.Getenv("OSS_BUCKET")),
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"netdisk/db"
 	"netdisk/middleware"
 	"netdisk/models"
+	"netdisk/storage"
 	"netdisk/utils"
 )
 
@@ -672,7 +674,9 @@ func FileItemHandler(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case action == "download" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
-    downloadHandler(w, r, id, user.ID)
+		downloadHandler(w, r, id, user.ID)
+	case action == "migrate" && r.Method == http.MethodPost:
+		migrateToObjectStorageHandler(w, r, id, user.ID)
 	case action == "rename" && r.Method == http.MethodPatch:
 		renameHandler(w, r, id, user.ID)
 	case action == "" && r.Method == http.MethodDelete:
@@ -688,9 +692,98 @@ func downloadHandler(w http.ResponseWriter, r *http.Request, id string, ownerID 
 		utils.WriteError(w, http.StatusNotFound, 10005, "file not found")
 		return
 	}
+	if rec.BlobHash != nil && strings.TrimSpace(*rec.BlobHash) != "" {
+		blob, err := db.GetBlobByHash(*rec.BlobHash)
+		if err == nil && strings.EqualFold(blob.StorageBackend, "oss") {
+			backend := storage.GetObjectBackend()
+			if backend == nil {
+				utils.WriteError(w, http.StatusServiceUnavailable, 10003, "object storage backend not configured")
+				return
+			}
+			downloadURL, err := backend.GetDownloadURL(blob.StorageKey, rec.Name)
+			if err != nil {
+				utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to get object storage download url")
+				return
+			}
+			http.Redirect(w, r, downloadURL, http.StatusFound)
+			return
+		}
+	}
 
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+rec.Name+"\"")
 	http.ServeFile(w, r, rec.DiskPath)
+}
+
+func migrateToObjectStorageHandler(w http.ResponseWriter, _ *http.Request, id string, ownerID int64) {
+	backend := storage.GetObjectBackend()
+	if backend == nil {
+		utils.WriteError(w, http.StatusServiceUnavailable, 10003, "object storage backend not configured")
+		return
+	}
+
+	rec, err := GetFileRecordForOwner(id, ownerID)
+	if err != nil {
+		utils.WriteError(w, http.StatusNotFound, 10005, "file not found")
+		return
+	}
+	if rec.BlobHash == nil || strings.TrimSpace(*rec.BlobHash) == "" {
+		utils.WriteError(w, http.StatusBadRequest, 10006, "file blob hash missing")
+		return
+	}
+
+	blob, err := db.GetBlobByHash(*rec.BlobHash)
+	if err != nil {
+		utils.WriteError(w, http.StatusNotFound, 10005, "file blob not found")
+		return
+	}
+	if strings.EqualFold(blob.StorageBackend, "oss") && strings.TrimSpace(blob.StorageKey) != "" {
+		utils.WriteJSON(w, http.StatusOK, models.APIResponse{
+			Code:    0,
+			Message: "already migrated",
+			Data: map[string]interface{}{
+				"id":              rec.ID,
+				"blob_hash":       blob.Hash,
+				"storage_backend": blob.StorageBackend,
+				"storage_key":     blob.StorageKey,
+			},
+		})
+		return
+	}
+
+	f, err := os.Open(blob.DiskPath)
+	// if err != nil {
+	// 	utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to open local file for migration")
+	// 	return
+	// }
+	if err != nil {
+		// log.Printf("OSS migrate failed for file %s (blob %s): %v", id, blob.Hash, err)
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to upload object to object storage")
+		return
+	}
+	defer f.Close()
+
+	objectKey := "blobs/" + blob.Hash
+	storedKey, err := backend.Save(f, objectKey, blob.SizeBytes)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to upload object to object storage")
+		return
+	}
+
+	if err := db.MarkBlobMigratedToObject(blob.Hash, storedKey); err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, 10003, "failed to update blob storage metadata")
+		return
+	}
+
+	utils.WriteJSON(w, http.StatusOK, models.APIResponse{
+		Code:    0,
+		Message: "migrated",
+		Data: map[string]interface{}{
+			"id":              rec.ID,
+			"blob_hash":       blob.Hash,
+			"storage_backend": "oss",
+			"storage_key":     storedKey,
+		},
+	})
 }
 
 func renameHandler(w http.ResponseWriter, r *http.Request, id string, ownerID int64) {
@@ -784,9 +877,12 @@ func deleteHandler(w http.ResponseWriter, _ *http.Request, id string, ownerID in
 	}
 
 	removePath := ""
+	removeObjectKey := ""
 	if blobHash.Valid && strings.TrimSpace(blobHash.String) != "" {
 		var blobDiskPath string
-		err = tx.QueryRow("SELECT disk_path FROM file_blobs WHERE hash = ? FOR UPDATE", blobHash.String).Scan(&blobDiskPath)
+		var blobBackend string
+		var blobStorageKey string
+		err = tx.QueryRow("SELECT disk_path, storage_backend, storage_key FROM file_blobs WHERE hash = ? FOR UPDATE", blobHash.String).Scan(&blobDiskPath, &blobBackend, &blobStorageKey)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			utils.WriteError(w, http.StatusInternalServerError, 10009, "failed to persist file metadata")
 			return
@@ -802,7 +898,11 @@ func deleteHandler(w http.ResponseWriter, _ *http.Request, id string, ownerID in
 				utils.WriteError(w, http.StatusInternalServerError, 10009, "failed to persist file metadata")
 				return
 			}
-			removePath = blobDiskPath
+			if strings.EqualFold(blobBackend, "oss") && strings.TrimSpace(blobStorageKey) != "" {
+				removeObjectKey = blobStorageKey
+			} else {
+				removePath = blobDiskPath
+			}
 		}
 	} else {
 		removePath = diskPath
@@ -811,6 +911,15 @@ func deleteHandler(w http.ResponseWriter, _ *http.Request, id string, ownerID in
 	if err := tx.Commit(); err != nil {
 		utils.WriteError(w, http.StatusInternalServerError, 10009, "failed to persist file metadata")
 		return
+	}
+
+	if removeObjectKey != "" {
+		backend := storage.GetObjectBackend()
+		if backend == nil {
+			log.Printf("warn: object storage backend unavailable when deleting object key=%s", removeObjectKey)
+		} else if err := backend.Delete(removeObjectKey); err != nil {
+			log.Printf("warn: failed to delete object storage key=%s: %v", removeObjectKey, err)
+		}
 	}
 
 	if removePath != "" {

@@ -23,14 +23,16 @@ type FileRecord struct {
 
 // FileBlob 物理文件块模型（去重用）
 type FileBlob struct {
-	Hash          string    `json:"hash"`
-	SizeBytes     int64     `json:"size_bytes"`
-	DiskPath      string    `json:"disk_path"`
-	RefCount      int       `json:"ref_count"`
-	CreatedAtUnix int64     `json:"created_at_unix"`
-	UpdatedAtUnix int64     `json:"updated_at_unix"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	Hash           string    `json:"hash"`
+	SizeBytes      int64     `json:"size_bytes"`
+	DiskPath       string    `json:"disk_path"`
+	StorageBackend string    `json:"storage_backend"`
+	StorageKey     string    `json:"storage_key"`
+	RefCount       int       `json:"ref_count"`
+	CreatedAtUnix  int64     `json:"created_at_unix"`
+	UpdatedAtUnix  int64     `json:"updated_at_unix"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // FolderRecord 文件夹元数据模型

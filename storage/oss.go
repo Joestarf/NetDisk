@@ -4,7 +4,6 @@ package storage
 import (
 	"fmt"
 	"io"
-	"net/url"
 	"strings"
 	"sync"
 
@@ -75,17 +74,14 @@ func (o *OSSBackend) Delete(key string) error {
 
 // GetDownloadURL 生成预签名下载 URL（有效期 1 小时）
 func (o *OSSBackend) GetDownloadURL(key string, filename string) (string, error) {
-	signedURL, err := o.bucket.SignURL(key, oss.HTTPGet, 3600)
+	cd := fmt.Sprintf("attachment; filename=\"%s\"", sanitizeFilename(filename))
+	options := []oss.Option{
+		oss.ResponseContentDisposition(cd),
+	}
+	signedURL, err := o.bucket.SignURL(key, oss.HTTPGet, 3600, options...)
 	if err != nil {
 		return "", fmt.Errorf("OSS sign URL failed: %w", err)
 	}
-	// 设置 Content-Disposition，让浏览器下载时优先使用原文件名。
-	cd := fmt.Sprintf("attachment; filename=\"%s\"", sanitizeFilename(filename))
-	sep := "&"
-	if !strings.Contains(signedURL, "?") {
-		sep = "?"
-	}
-	signedURL += sep + "response-content-disposition=" + url.QueryEscape(cd)
 	return signedURL, nil
 }
 

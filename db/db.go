@@ -110,6 +110,8 @@ func initTables() error {
 		  hash VARCHAR(64) PRIMARY KEY,
 		  size_bytes BIGINT NOT NULL,
 		  disk_path VARCHAR(1024) NOT NULL,
+		  storage_backend VARCHAR(32) NOT NULL DEFAULT 'local',
+		  storage_key VARCHAR(1024) NOT NULL DEFAULT '',
 		  ref_count INT NOT NULL DEFAULT 1,
 		  created_at_unix BIGINT NOT NULL,
 		  updated_at_unix BIGINT NOT NULL
@@ -187,6 +189,34 @@ ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT NULL
 `
 	if _, err := DB.Exec(ensureBioColumn); err != nil {
 		if _, err2 := DB.Exec("ALTER TABLE users ADD COLUMN bio TEXT DEFAULT NULL"); err2 != nil {
+			if !strings.Contains(strings.ToLower(err2.Error()), "duplicate column") {
+				_ = DB.Close()
+				return err2
+			}
+		}
+	}
+
+	// 确保 file_blobs.storage_backend 列存在
+	const ensureBlobStorageBackendColumn = `
+ALTER TABLE file_blobs
+ADD COLUMN IF NOT EXISTS storage_backend VARCHAR(32) NOT NULL DEFAULT 'local'
+`
+	if _, err := DB.Exec(ensureBlobStorageBackendColumn); err != nil {
+		if _, err2 := DB.Exec("ALTER TABLE file_blobs ADD COLUMN storage_backend VARCHAR(32) NOT NULL DEFAULT 'local'"); err2 != nil {
+			if !strings.Contains(strings.ToLower(err2.Error()), "duplicate column") {
+				_ = DB.Close()
+				return err2
+			}
+		}
+	}
+
+	// 确保 file_blobs.storage_key 列存在
+	const ensureBlobStorageKeyColumn = `
+ALTER TABLE file_blobs
+ADD COLUMN IF NOT EXISTS storage_key VARCHAR(1024) NOT NULL DEFAULT ''
+`
+	if _, err := DB.Exec(ensureBlobStorageKeyColumn); err != nil {
+		if _, err2 := DB.Exec("ALTER TABLE file_blobs ADD COLUMN storage_key VARCHAR(1024) NOT NULL DEFAULT ''"); err2 != nil {
 			if !strings.Contains(strings.ToLower(err2.Error()), "duplicate column") {
 				_ = DB.Close()
 				return err2
@@ -508,7 +538,7 @@ func getBlobByHashTx(queryer interface {
 }, hash string) (*models.FileBlob, error) {
 	var blob models.FileBlob
 	err := queryer.QueryRow(
-		`SELECT hash, size_bytes, disk_path, ref_count, created_at_unix, updated_at_unix
+		`SELECT hash, size_bytes, disk_path, storage_backend, storage_key, ref_count, created_at_unix, updated_at_unix
 		 FROM file_blobs
 		 WHERE hash = ?`,
 		hash,
@@ -516,6 +546,8 @@ func getBlobByHashTx(queryer interface {
 		&blob.Hash,
 		&blob.SizeBytes,
 		&blob.DiskPath,
+		&blob.StorageBackend,
+		&blob.StorageKey,
 		&blob.RefCount,
 		&blob.CreatedAtUnix,
 		&blob.UpdatedAtUnix,
@@ -534,8 +566,8 @@ func getBlobByHashTx(queryer interface {
 // CreateBlob 在事务内创建 blob 记录。
 func CreateBlob(tx *sql.Tx, hash string, size int64, diskPath string) error {
 	_, err := tx.Exec(
-		`INSERT INTO file_blobs(hash, size_bytes, disk_path, ref_count, created_at_unix, updated_at_unix)
-		 VALUES (?, ?, ?, 1, ?, ?)`,
+		`INSERT INTO file_blobs(hash, size_bytes, disk_path, storage_backend, storage_key, ref_count, created_at_unix, updated_at_unix)
+		 VALUES (?, ?, ?, 'local', '', 1, ?, ?)`,
 		hash,
 		size,
 		diskPath,
@@ -543,6 +575,31 @@ func CreateBlob(tx *sql.Tx, hash string, size int64, diskPath string) error {
 		time.Now().Unix(),
 	)
 	return err
+}
+
+// MarkBlobMigratedToObject 标记 blob 已迁移到对象存储。
+func MarkBlobMigratedToObject(hash string, objectKey string) error {
+	result, err := DB.Exec(
+		`UPDATE file_blobs
+		 SET storage_backend = 'oss',
+		     storage_key = ?,
+		     updated_at_unix = ?
+		 WHERE hash = ?`,
+		objectKey,
+		time.Now().Unix(),
+		hash,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return os.ErrNotExist
+	}
+	return nil
 }
 
 // IncrementBlobRefCount 在事务内增加 blob 引用计数。

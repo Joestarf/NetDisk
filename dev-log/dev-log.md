@@ -120,4 +120,18 @@
   
   9. 还是得测试啊……，不然怎么知道copilot写了个什么史山，发现了上传文件未做hash校验，让我来加上分片哈希校验（可选）以及最后的文件哈希校验（强制）。
   
-  8. 可恶，支持GET 不支持HEAD，copilot是什么神人，已修复。
+  10. 可恶，支持GET 不支持HEAD，copilot是什么神人，已修复。
+  
+  11. 要死了，三点钟写完睡觉起来参加水的不行的蓝桥杯又匆忙回来赶项目，我真的要成为张雪峰了……
+  
+  12. 这个转移对象存储好麻烦，我完全力竭了，全靠copilot大手子了，开通了阿里云的oss进行了测试，endpoint和bucket名字正确，也顺利实现了上传，签名和删除（但是我自己都不知道写了啥玩意，让我研究一下）
+  
+      - 在``db.go``中给``file_blobs``增加了两个字段storage_backend 和 storage_key用来表示是本地存储还是oss存储以及oss的对象是什么。
+      - 在``files.go``中增加了action=migrate（表示迁移）
+        迁移流程：
+        读本地文件 -> 上传到 OSS -> 更新数据库为 oss + key
+      - 当storage_backend=oss时，不会进行本地的下载服务，而是返回oss的预签名链接，让用户在那里下载。
+      - 删除也支持删除oss对象。
+  
+  13. `SignURL` 生成的签名只基于 `key` 和 `HTTPGet` 动作，不包含 `response-content-disposition`，当使用带有该参数的 URL 请求时，OSS 发现参数变化，签名校验失败。
+      将原本的手动拼接改为通过 `oss.WithResponseContentDisposition` 将参数传给 `SignURL`让他在计算签名的时候会将options中的参数纳入计算，即可包含``response-content-disposition``。
